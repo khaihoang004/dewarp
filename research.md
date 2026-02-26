@@ -12,3 +12,4 @@ LiR | Image Restoration, denoise|  7.31 params| [Link](https://arxiv.org/pdf/240
 |||| [Link](https://link.springer.com/chapter/10.1007/978-981-19-1673-1_21)|
 |High-Resolution Document Shadow Removal via A Large-Scale Real-World
 Dataset and A Frequency-Aware Shadow Erasing Net||| [Link](https://arxiv.org/pdf/2308.14221)
+DvD: Unleashing a Generative Paradigm for Document Dewarping via Coordinates-based Diffusion Model|||https://arxiv.org/pdf/2505.21975
