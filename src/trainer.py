@@ -5,11 +5,25 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Dict
-
+import torch.nn.functional as F
+import numpy as np
 from src.training_utils.checkpoint_saver import CheckpointSaver
 from src.training_utils.wandb import WandbLogger
 
-
+def unwarp(img: torch.Tensor, bm: torch.Tensor) -> torch.Tensor:
+    """
+    Unwarp ảnh bằng backward map.
+    bm: (B, 2, H, W) range [-1,1]
+    """
+    grid = bm.permute(0, 2, 3, 1)  # (B, H, W, 2)
+    return F.grid_sample(
+        img,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+    
 class Trainer:
     """
     Trainer cho document dewarping.
@@ -58,7 +72,7 @@ class Trainer:
 
         # Mixed Precision
         self.use_amp = use_amp
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler('cuda', enabled=self.use_amp)
 
         # Training params
         self.epochs = epochs
@@ -104,9 +118,24 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=self.use_amp):
-                pred = self.model(img)
-                loss, loss_dict = self.criterion(pred, tgt, img)
-
+                pred_bm = self.model(img)
+                
+                pred_unwarped = unwarp(img, pred_bm)
+                gt_unwarped = unwarp(img, tgt)
+                
+                warped_img_np = None
+                if self.criterion.lambda_curv > 0:  # chỉ convert nếu cần curvature
+                    warped_img_np = (img[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)     
+                    
+                               
+                loss, loss_dict = self.criterion(
+                    pred_img=pred_unwarped,
+                    gt_img=gt_unwarped,
+                    pred_bm=pred_bm,
+                    gt_bm=tgt,
+                    warped_img_np=warped_img_np
+                )
+                
             if is_train:
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
@@ -117,7 +146,11 @@ class Trainer:
 
             if is_train:
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
-
+            
+            # if self.logger and is_train:
+            #     log_dict = {"train/" + k: v for k, v in loss_dict.items()}
+            #     self.logger.log(log_dict)
+                
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         return {"loss": avg_loss}
 
@@ -161,7 +194,7 @@ class Trainer:
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 best_epoch = epoch
-                print(f"  → Best val loss updated: {best_val_loss:.4f} (epoch {epoch})")
+                print(f"-> Best val loss updated: {best_val_loss:.4f} (epoch {epoch})")
 
         # Test nếu có test_loader
         if self.test_loader is not None:
@@ -186,3 +219,9 @@ class Trainer:
         loaded_epoch = checkpoint.get("epoch", 0)
         print(f"Resumed from: {ckpt_path} | starting from epoch {loaded_epoch + 1}")
         return loaded_epoch + 1
+
+    def get_model(self) -> torch.nn.Module:
+        return self.model
+
+    def get_model_state_dict(self) -> dict:
+        return self.model.state_dict()

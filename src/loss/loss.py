@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+import easyocr
 from pytorch_msssim import ssim
 
 class CharbonnierLoss(nn.Module):
@@ -32,31 +32,80 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
     return weight * (loss_x + loss_y)
 
 
+reader = easyocr.Reader(['en'], gpu=True)
 
-def curvature_consistency_loss(pred_bm, gt_bm, line_points, eps=1e-4):
+def extract_line_points(image_np, num_points_per_line=10):
     """
-    Curvature loss như Eq.5-6.
-    line_points: tensor (N, 2) hoặc list points trên line elements (giả sử đã project)
-    Thực tế cần bilinear sample tại points → dùng grid_sample hoặc interpolate
-    Ở đây giả lập đơn giản (thay bằng implement chính xác nếu có line_points thật)
+    image_np: numpy array (H, W, 3) hoặc (H, W) grayscale
+    Trả về: tensor (N, 2) - normalized coordinates [0,1]x[0,1]
     """
-    # Giả lập: flatten và tính curvature trên toàn map (approximation cho test)
-    # Thực tế: sample tại line points như paper
+    results = reader.readtext(image_np, detail=1, paragraph=False)
+    
+    points = []
+    for (bbox, text, prob) in results:
+        if prob < 0.5: continue  # lọc nhiễu
+        
+        # Lấy 4 góc bounding box
+        (tl, tr, br, bl) = bbox
+        # Lấy baseline: từ tl → bl và tr → br, lấy midpoint
+        mid_left = (tl[0] + bl[0])/2, (tl[1] + bl[1])/2
+        mid_right = (tr[0] + br[0])/2, (tr[1] + br[1])/2
+        
+        # Sample num_points_per_line điểm đều trên baseline
+        for t in np.linspace(0, 1, num_points_per_line):
+            x = mid_left[0] + t * (mid_right[0] - mid_left[0])
+            y = mid_left[1] + t * (mid_right[1] - mid_left[1])
+            points.append([x / image_np.shape[1], y / image_np.shape[0]])  # normalize [0,1]
+
+    if len(points) == 0:
+        return None
+    
+    return torch.tensor(points, dtype=torch.float32)  # (N, 2)
+
+def curvature_consistency_loss(
+    pred_bm, gt_bm, 
+    warped_img_np=None, 
+    line_points=None, 
+    ocr_reader=None, 
+    eps=1e-4
+):
+    if line_points is None and warped_img_np is not None and ocr_reader is not None:
+        line_points = extract_line_points(warped_img_np, reader=ocr_reader)
+
+    if line_points is not None and len(line_points) > 10:
+        # Sample tại sparse points (như code trước)
+        grid = line_points.unsqueeze(0).unsqueeze(0).unsqueeze(0) * 2 - 1
+        grid = grid.expand(pred_bm.shape[0], -1, -1, 2)
+
+        pred_sample = F.grid_sample(pred_bm, grid, mode='bilinear', align_corners=True)
+        gt_sample = F.grid_sample(gt_bm, grid, mode='bilinear', align_corners=True)
+
+        # Curvature 1D
+        def curv_1d(bm_seq):
+            bm_seq = bm_seq.squeeze(2)  # (B, 2, N)
+            dx = bm_seq[:, 0, 1:] - bm_seq[:, 0, :-1]
+            dy = bm_seq[:, 1, 1:] - bm_seq[:, 1, :-1]
+            ddx = dx[:, 1:] - dx[:, :-1]
+            ddy = dy[:, 1:] - dy[:, :-1]
+            ddx = F.pad(ddx, (0, 1))
+            ddy = F.pad(ddy, (0, 1))
+            num = torch.abs(dx * ddy - dy * ddx)
+            den = (dx**2 + dy**2).pow(1.5) + eps
+            return (num / den).mean(dim=-1).mean()
+
+        return torch.abs(curv_1d(pred_sample) - curv_1d(gt_sample))
+    
+    # Fallback: approximation toàn map (như cũ)
     def compute_curvature(bm):
-        # Central difference cho derivative
         dx = bm[:, :, :, 1:] - bm[:, :, :, :-1]
         dy = bm[:, :, 1:, :] - bm[:, :, :-1, :]
         ddx = dx[:, :, :, 1:] - dx[:, :, :, :-1]
         ddy = dy[:, :, 1:, :] - dy[:, :, :-1, :]
-
-        # Pad để khớp size
         ddx = F.pad(ddx, (0, 1, 0, 0))
         ddy = F.pad(ddy, (0, 0, 0, 1))
-
         num = torch.abs(dx * ddy - dy * ddx)
         den = (dx**2 + dy**2).pow(1.5) + eps
-        kappa = num / den
-        return kappa.mean()
+        return (num / den).mean()
 
     kappa_pred = compute_curvature(pred_bm)
     kappa_gt = compute_curvature(gt_bm)
@@ -123,6 +172,7 @@ class DewarpLoss(nn.Module):
         self.lambda_pde = lambda_pde
 
         self.charbonnier = CharbonnierLoss()
+        self.ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
 
     def forward(
         self,
@@ -130,6 +180,7 @@ class DewarpLoss(nn.Module):
         gt_img,
         pred_bm,
         gt_bm,
+        warped_img_np=None,
         line_points=None
     ):
 
@@ -159,7 +210,17 @@ class DewarpLoss(nn.Module):
         l_curv = 0
         if line_points is not None:
             l_curv = curvature_consistency_loss(pred_bm, gt_bm_up, line_points)
-
+        
+        l_curv = 0.0
+        if self.lambda_curv > 0:
+            reader = self.ocr_reader
+            if reader is not None:
+                l_curv = curvature_consistency_loss(
+                    pred_bm, gt_bm_up,
+                    warped_img_np=warped_img_np,
+                    line_points=line_points,
+                    ocr_reader=reader
+                )
         # Total loss
         total = (
             self.lambda_recon * l_recon
