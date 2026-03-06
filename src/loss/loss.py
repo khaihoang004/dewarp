@@ -102,12 +102,18 @@ def curvature_consistency_loss(
     
     # Fallback: approximation toàn map (như cũ)
     def compute_curvature(bm):
-        dx = bm[:, :, :, 1:] - bm[:, :, :, :-1]
-        dy = bm[:, :, 1:, :] - bm[:, :, :-1, :]
-        ddx = dx[:, :, :, 1:] - dx[:, :, :, :-1]
-        ddy = dy[:, :, 1:, :] - dy[:, :, :-1, :]
-        ddx = F.pad(ddx, (0, 1, 0, 0))
-        ddy = F.pad(ddy, (0, 0, 0, 1))
+        dx = bm[:, :, :, 1:] - bm[:, :, :, :-1]     # (B, 2, H, W-1)
+        dy = bm[:, :, 1:, :] - bm[:, :, :-1, :]     # (B, 2, H-1, W)
+        
+        dx = F.pad(dx, (0, 1, 0, 0), mode='replicate')   # pad right width +1 -> W
+        dy = F.pad(dy, (0, 0, 0, 1), mode='replicate')   # pad bottom height +1 -> H
+        
+        ddx = dx[:, :, :, 1:] - dx[:, :, :, :-1]     # (B, 2, H, W-2)
+        ddy = dy[:, :, 1:, :] - dy[:, :, :-1, :]     # (B, 2, H-2, W)
+        
+        ddx = F.pad(ddx, (0, 2, 0, 0), mode='replicate')  # pad right +2 -> W
+        ddy = F.pad(ddy, (0, 0, 2, 0), mode='replicate')  # pad bottom +2 -> H
+        
         num = torch.abs(dx * ddy - dy * ddx)
         den = (dx**2 + dy**2).pow(1.5) + eps
         return (num / den).mean()
