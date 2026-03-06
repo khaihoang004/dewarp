@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import easyocr
+import cv2
 from pytorch_msssim import ssim
 
 class CharbonnierLoss(nn.Module):
@@ -35,9 +36,11 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
 reader = easyocr.Reader(['en'], gpu=True)
 
 def extract_line_points(image_np, reader, num_points_per_line=10):
-    if image_np.dtype != np.uint8:
-        image_np = (image_np).astype(np.uint8)
-
+    if len(image_np.shape) == 2: # Nếu là grayscale
+        image_np = cv2.cvtColor(image_np, cv2.COLOR_GRAY2RGB)
+    
+    image_np = np.ascontiguousarray(image_np, dtype=np.uint8)
+    
     results = reader.readtext(image_np, detail=1, paragraph=False)
     
     points = []
