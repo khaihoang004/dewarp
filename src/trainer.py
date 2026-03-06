@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Dict
@@ -105,7 +105,7 @@ class Trainer:
             if is_train:
                 self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type='cuda', enabled=self.use_amp):
                 pred_bm, pred_mask = self.model(img)
                 
                 pred_unwarped = unwarp(img, pred_bm)
