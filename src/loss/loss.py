@@ -33,13 +33,14 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
     return weight * (loss_x + loss_y)
 
 def extract_line_points(image_np, reader, num_points_per_line=10):
-    print(f"Debug EasyOCR input - shape: {image_np.shape}, dtype: {image_np.dtype}, min: {image_np.min()}, max: {image_np.max()}")
-    print(f"Debug: Is contiguous? {image_np.flags['C_CONTIGUOUS']}")
-    image_np = cv2.equalizeHist(cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)) if len(image_np.shape) == 3 else image_np
-    image_np = cv2.cvtColor(image_np, cv2.COLOR_GRAY2RGB) if len(image_np.shape) == 2 else image_np
-    
     try:
-        results = reader.readtext(image_np, detail=1, paragraph=False)
+        results = reader.readtext(
+            image_np,
+            detail=1,
+            paragraph=False,
+            text_threshold=0.5,
+            low_text=0.3
+        )
         print(f"Debug: EasyOCR success - {len(results)} detections")
     except Exception as e:
         print(f"EasyOCR failed: {str(e)}")
