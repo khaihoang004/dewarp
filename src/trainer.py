@@ -185,7 +185,7 @@ class Trainer:
                 best_epoch = epoch
                 print(f"-> Best val loss updated: {best_val_loss:.4f} (epoch {epoch})")
 
-            if epoch % 4 == 0 or epoch == 1:
+            if epoch % 1 == 0 or epoch == 1:
                 print(f"--> Visualizing results at epoch {epoch}...")
                 self._visualize_results(self.val_loader, epoch, phase="Val")
                 
