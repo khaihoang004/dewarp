@@ -41,9 +41,7 @@ def extract_line_points(image_np, reader, num_points_per_line=10):
             text_threshold=0.5,
             low_text=0.3
         )
-        print(f"Debug: EasyOCR success - {len(results)} detections")
     except Exception as e:
-        print(f"EasyOCR failed: {str(e)}")
         return None
     
     points = []
