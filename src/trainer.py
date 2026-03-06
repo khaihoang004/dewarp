@@ -111,12 +111,14 @@ class Trainer:
                 pred_unwarped = unwarp(img, pred_bm)
                 gt_unwarped = unwarp(img, tgt)
                 
+                print(f"Debug: img shape: {img.shape}, dtype: {img.dtype}, min-max: {img.min().item()} - {img.max().item()}")
                 warped_img_np = None
                 if self.criterion.lambda_curv > 0:
                     # Lấy ảnh đầu batch (RGB, uint8)
                     sample_img = img[0].cpu().permute(1, 2, 0).clamp(0, 1).numpy()
                     warped_img_np = (sample_img * 255).astype(np.uint8)     
-                               
+                    print(f"Debug: warped_img_np shape: {warped_img_np.shape}, dtype: {warped_img_np.dtype}, min-max: {warped_img_np.min()} - {warped_img_np.max()}")
+                    
                 loss, loss_dict = self.criterion(
                     pred_img=pred_unwarped,
                     gt_img=gt_unwarped,

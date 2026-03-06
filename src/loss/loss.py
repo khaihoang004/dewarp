@@ -35,7 +35,9 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
 reader = easyocr.Reader(['en'], gpu=True)
 
 def extract_line_points(image_np, reader, num_points_per_line=10):
+    print(f"Debug: Input to EasyOCR - image_np shape: {image_np.shape}, dtype: {image_np.dtype}, min-max: {image_np.min()} - {image_np.max()}")
     results = reader.readtext(image_np, detail=1, paragraph=False)
+    print(f"Debug: EasyOCR results: {len(results)} detections")
     
     points = []
     for (bbox, text, prob) in results:
