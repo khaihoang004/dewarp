@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Dict
 import torch.nn.functional as F
 import numpy as np
+import wandb
 
 from src.training_utils.checkpoint_saver import CheckpointSaver
 from src.training_utils.wandb import WandbLogger
@@ -111,9 +112,10 @@ class Trainer:
                 gt_unwarped = unwarp(img, tgt)
                 
                 warped_img_np = None
-                if self.criterion.lambda_curv > 0:  # chỉ convert nếu cần curvature
-                    warped_img_np = (img[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)     
-                    
+                if self.criterion.lambda_curv > 0:
+                    # Lấy ảnh đầu batch (RGB, uint8)
+                    sample_img = img[0].cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+                    warped_img_np = (sample_img * 255).astype(np.uint8)     
                                
                 loss, loss_dict = self.criterion(
                     pred_img=pred_unwarped,
