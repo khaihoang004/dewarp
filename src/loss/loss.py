@@ -32,9 +32,6 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
     
     return weight * (loss_x + loss_y)
 
-
-reader = easyocr.Reader(['en'], gpu=True)
-
 def extract_line_points(image_np, reader, num_points_per_line=10):
     print(f"Debug EasyOCR input - shape: {image_np.shape}, dtype: {image_np.dtype}, min: {image_np.min()}, max: {image_np.max()}")
     print(f"Debug: Is contiguous? {image_np.flags['C_CONTIGUOUS']}")
@@ -168,7 +165,7 @@ class DewarpLoss(nn.Module):
         self.lambda_pde = lambda_pde
 
         self.charbonnier = CharbonnierLoss()
-        self.ocr_reader = easyocr.Reader(['en'], gpu=False)
+        self.ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
         
     def forward(
         self,
