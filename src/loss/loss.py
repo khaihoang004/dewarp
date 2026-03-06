@@ -165,7 +165,7 @@ class DewarpLoss(nn.Module):
         self.lambda_pde = lambda_pde
 
         self.charbonnier = CharbonnierLoss()
-        self.ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+        self.ocr_reader = easyocr.Reader(['en'], gpu=False)
         
     def forward(
         self,
