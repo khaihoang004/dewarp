@@ -6,7 +6,6 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Dict
 
-from ..config import Config
 from src.training_utils.checkpoint_saver import CheckpointSaver
 from src.training_utils.wandb import WandbLogger
 
@@ -22,7 +21,6 @@ class Trainer:
 
     def __init__(
         self,
-        cfg: Config,
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
         model: nn.Module,
@@ -33,8 +31,7 @@ class Trainer:
         logger: Optional[WandbLogger] = None,
         test_loader: Optional[torch.utils.data.DataLoader] = None,
     ):
-        self.cfg = cfg
-        self.device = cfg.device
+        self.device = device
 
         # Model
         self.model = model
@@ -48,23 +45,15 @@ class Trainer:
         # Optimizer
         self.optimizer = optimizer if optimizer is not None else torch.optim.AdamW(
             self.model.parameters(),
-            lr=cfg.lr,
-            weight_decay=getattr(cfg, 'weight_decay', 1e-5),
+            lr=2e-4,
         )
-
-        # Mixed Precision
-        self.scaler = GradScaler(enabled=getattr(cfg, 'amp', True))
 
         # DataLoaders
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
 
-        # Checkpoint Saver - KHÔNG truyền model vào đây
-        self.saver = saver if saver is not None else CheckpointSaver(
-            save_dir=str(Path(cfg.checkpoint_dir)),
-            max_ckpt=getattr(cfg, 'max_checkpoints', 5),
-        )
+        self.saver = saver if saver is not None else CheckpointSaver(save_dir='checkpoints', max_ckpt=5)
 
         # Logger
         self.logger = logger
