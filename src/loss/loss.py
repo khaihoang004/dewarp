@@ -34,11 +34,10 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
 
 reader = easyocr.Reader(['en'], gpu=True)
 
-def extract_line_points(image_np, num_points_per_line=10):
-    """
-    image_np: numpy array (H, W, 3) hoặc (H, W) grayscale
-    Trả về: tensor (N, 2) - normalized coordinates [0,1]x[0,1]
-    """
+def extract_line_points(image_np, reader, num_points_per_line=10):
+    if image_np.dtype != np.uint8:
+        image_np = (image_np).astype(np.uint8)
+
     results = reader.readtext(image_np, detail=1, paragraph=False)
     
     points = []
