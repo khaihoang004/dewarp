@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from .utils import load_image, load_mat, crop_tight
 from .transforms import get_appearance_transform
 
-class Doc3D(Dataset):
+class Doc3DDataset(Dataset):
     """ Custom Dataset for loading Doc3D data with appearance augmentations. """
     def __init__(self, paths, img_size=(356, 244), bm_size=(45, 31), appearance_augmentation=[]):
         self.paths = paths
@@ -76,8 +76,8 @@ if __name__ == "__main__":
 
     # appearance_augs = ['visual', 'color',] # 'noise', 'shadow', 'blur']
     appearance_augs = [] # Use None for now
-    doc3d_dataset = Doc3D(train_paths)
-    val_dataset = Doc3D(val_paths)
+    doc3d_dataset = Doc3DDataset(train_paths)
+    val_dataset = Doc3DDataset(val_paths)
 
     print(f'Train doc3d dataset size: {len(doc3d_dataset)}')
     print(f'Validation set size: {len(val_dataset)}')

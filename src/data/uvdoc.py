@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from .utils import load_image, load_mat, crop_tight
 from .transforms import get_appearance_transform
 
-class UVDoc(Dataset):
+class UVDocDataset(Dataset):
     """ Custom Dataset for loading UVDoc data with appearance augmentations. """
     def __init__(self, root_dir, img_size=(356, 244), bm_size=(45, 31), appearance_augmentation=[]):
         self.root_dir = root_dir
@@ -59,6 +59,6 @@ class UVDoc(Dataset):
 
 # Initialize dataset
 if __name__ == "__main__":
-    uvdoc_dataset = UVDoc(root_dir="/kaggle/input/datasets/kahazai/uvdoc-dataset/UVDoc_final/UVDoc_final", img_size=(356, 244), bm_size=(45, 31))
+    uvdoc_dataset = UVDocDataset(root_dir="/kaggle/input/datasets/kahazai/uvdoc-dataset/UVDoc_final/UVDoc_final", img_size=(356, 244), bm_size=(45, 31))
     print(f'Train uvdoc dataset size: {len(uvdoc_dataset)}')
     

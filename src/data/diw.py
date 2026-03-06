@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from .utils import load_image, load_mat, crop_tight
 from .transforms import get_appearance_transform
 
-class DIW(Dataset):
+class DIWDataset(Dataset):
     """ Evaluation dataset for DIW data. """
     def __init__(self, paths, img_size=(356, 244)):
         self.paths = paths
@@ -44,7 +44,7 @@ if __name__ == "__main__":
     # Create datasets
     batch_size = 8
     # transform = v2.Compose([v2.ToTensor()])
-    test_dataset = DIW(test_paths)
+    test_dataset = DIWDataset(test_paths)
     print(f'Test set size: {len(test_dataset)}')
 
     # Create DataLoaders
