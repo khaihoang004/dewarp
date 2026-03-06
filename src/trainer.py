@@ -196,6 +196,10 @@ class Trainer:
                 best_epoch = epoch
                 print(f"-> Best val loss updated: {best_val_loss:.4f} (epoch {epoch})")
 
+            if epoch % 4 == 0 or epoch == 1:
+                print(f"--> Visualizing results at epoch {epoch}...")
+                self._visualize_results(self.val_loader, epoch, phase="Val")
+                
         # Test nếu có test_loader
         if self.test_loader is not None:
             test_metrics = self._run_phase(self.test_loader, is_train=False, phase_name="Test")
@@ -225,3 +229,44 @@ class Trainer:
 
     def get_model_state_dict(self) -> dict:
         return self.model.state_dict()
+    
+    def _visualize_results(self, loader, epoch, phase="Val"):
+        """
+        Lấy 1 batch từ loader, unwarp và log kết quả lên WandB.
+        """
+        self.model.eval()
+        with torch.no_grad():
+            # Lấy 1 batch đầu tiên
+            batch = next(iter(loader))
+            img = batch[0][:4].to(self.device)  # Lấy tối đa 4 ảnh để visualize
+            tgt = batch[1][:4].to(self.device)
+
+            with autocast(enabled=self.use_amp):
+                pred_bm = self.model(img)
+                pred_unwarped = unwarp(img, pred_bm)
+                gt_unwarped = unwarp(img, tgt)
+
+            # Chuyển đổi tensor sang numpy để hiển thị (B, C, H, W) -> (B, H, W, C)
+            def to_img(t):
+                t = t.detach().cpu().permute(0, 2, 3, 1).numpy()
+                t = np.clip(t, 0, 1)
+                return (t * 255).astype(np.uint8)
+
+            imgs_np = to_img(img)
+            preds_np = to_img(pred_unwarped)
+            gts_np = to_img(gt_unwarped)
+
+            viz_list = []
+            for i in range(len(imgs_np)):
+                # Ghép 3 ảnh theo chiều ngang: Gốc | Dự đoán | Đích
+                combined = np.concatenate([imgs_np[i], preds_np[i], gts_np[i]], axis=1)
+                viz_list.append(combined)
+
+            # Log lên WandB
+            if self.logger:
+                import wandb
+                # Ghép các cặp ảnh theo chiều dọc
+                final_viz = np.concatenate(viz_list, axis=0)
+                self.logger.log({
+                    f"visualize/{phase}": wandb.Image(final_viz, caption=f"Epoch {epoch}: Input | Pred | GT")
+                })
