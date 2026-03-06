@@ -1,39 +1,51 @@
+# src/model/model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SimpleUNet(nn.Module):
-
+class SimpleDewarpNet(nn.Module):
+    """
+    Model encoder-decoder đơn giản, không skip connection.
+    Dùng để test pipeline nhanh, không quan tâm size input có chia hết hay không.
+    Input: (B, 3, H, W) → Output: (B, 2, H, W) backward map
+    """
     def __init__(self, in_channels=3, out_channels=2, base_filters=32):
-        super(SimpleUNet, self).__init__()
+        super(SimpleDewarpNet, self).__init__()
         
-        # Encoder
+        # Encoder (downsample)
         self.enc1 = self._conv_block(in_channels, base_filters)
         self.enc2 = self._conv_block(base_filters, base_filters * 2)
         self.enc3 = self._conv_block(base_filters * 2, base_filters * 4)
-        self.enc4 = self._conv_block(base_filters * 4, base_filters * 8)
         
         # Bottleneck
-        self.bottleneck = self._conv_block(base_filters * 8, base_filters * 16)
+        self.bottleneck = self._conv_block(base_filters * 4, base_filters * 8)
         
-        # Decoder
-        self.up4 = nn.ConvTranspose2d(base_filters * 16, base_filters * 8, kernel_size=2, stride=2)
-        self.dec4 = self._conv_block(base_filters * 16, base_filters * 8)  # skip + up
+        # Decoder (upsample + conv)
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(base_filters * 8, base_filters * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(base_filters * 4),
+            nn.ReLU(inplace=True),
+        )
+        self.dec3 = self._conv_block(base_filters * 4, base_filters * 4)
         
-        self.up3 = nn.ConvTranspose2d(base_filters * 8, base_filters * 4, kernel_size=2, stride=2)
-        self.dec3 = self._conv_block(base_filters * 8, base_filters * 4)
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(base_filters * 4, base_filters * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(base_filters * 2),
+            nn.ReLU(inplace=True),
+        )
+        self.dec2 = self._conv_block(base_filters * 2, base_filters * 2)
         
-        self.up2 = nn.ConvTranspose2d(base_filters * 4, base_filters * 2, kernel_size=2, stride=2)
-        self.dec2 = self._conv_block(base_filters * 4, base_filters * 2)
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(base_filters * 2, base_filters, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(base_filters),
+            nn.ReLU(inplace=True),
+        )
+        self.dec1 = self._conv_block(base_filters, base_filters)
         
-        self.up1 = nn.ConvTranspose2d(base_filters * 2, base_filters, kernel_size=2, stride=2)
-        self.dec1 = self._conv_block(base_filters * 2, base_filters)
-        
-        # Final conv
+        # Final
         self.final = nn.Conv2d(base_filters, out_channels, kernel_size=1)
-        
-        self.tanh = nn.Tanh()
+        self.tanh = nn.Tanh()  # nếu backward map range [-1, 1]
 
     def _conv_block(self, in_c, out_c):
         return nn.Sequential(
@@ -50,46 +62,42 @@ class SimpleUNet(nn.Module):
         e1 = self.enc1(x)
         e2 = self.enc2(F.max_pool2d(e1, 2))
         e3 = self.enc3(F.max_pool2d(e2, 2))
-        e4 = self.enc4(F.max_pool2d(e3, 2))
         
         # Bottleneck
-        b = self.bottleneck(F.max_pool2d(e4, 2))
+        b = self.bottleneck(F.max_pool2d(e3, 2))
         
-        # Decoder + skip connections
-        d4 = self.up4(b)
-        d4 = torch.cat([d4, e4], dim=1)
-        d4 = self.dec4(d4)
-        
-        d3 = self.up3(d4)
-        d3 = torch.cat([d3, e3], dim=1)
+        # Decoder - upsample + conv (không concat)
+        d3 = self.up3(b)
         d3 = self.dec3(d3)
         
         d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2], dim=1)
         d2 = self.dec2(d2)
         
         d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
         
         out = self.final(d1)
-        out = self.tanh(out)
+        out = self.tanh(out)  # hoặc sigmoid nếu range [0,1]
+        
+        # Đảm bảo output size bằng input size (nếu lệch do pooling)
+        if out.shape[2:] != x.shape[2:]:
+            out = F.interpolate(out, size=x.shape[2:], mode='bilinear', align_corners=False)
         
         return out
 
 
-def build_model(cfg):
-
-    return SimpleUNet(
-        in_channels=cfg.in_channels if hasattr(cfg, 'in_channels') else 3,
-        out_channels=cfg.out_channels if hasattr(cfg, 'out_channels') else 2,
-        base_filters=32
+def build_model():
+    # Không cần cfg nữa, hardcode đơn giản cho test
+    return SimpleDewarpNet(
+        in_channels=3,
+        out_channels=2,
+        base_filters=32   # nhỏ để train nhanh
     )
 
 
+# Test nhanh
 if __name__ == "__main__":
-    model = build_model(type('Config', (), {'in_channels': 3, 'out_channels': 2})())
-    dummy_input = torch.randn(2, 3, 384, 384)
-    output = model(dummy_input)
-    print(f"Input shape: {dummy_input.shape}")
-    print(f"Output shape: {output.shape}")
+    model = build_model()
+    dummy = torch.randn(2, 3, 356, 244)
+    out = model(dummy)
+    print(out.shape)  # nên là [2, 2, 356, 244]
