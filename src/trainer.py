@@ -97,8 +97,8 @@ class Trainer:
         pbar = tqdm(loader, desc=phase_name, leave=is_train)
 
         for batch in pbar:
-            img = batch["image"].to(self.device)
-            tgt = batch["target"].to(self.device)
+            img = batch[0].to(self.device)
+            tgt = batch[1].to(self.device)
 
             if is_train:
                 self.optimizer.zero_grad(set_to_none=True)
