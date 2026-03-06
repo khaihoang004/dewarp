@@ -24,14 +24,21 @@ class Trainer:
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
         model: nn.Module,
-        device,
+        device: torch.device | str,
         criterion: nn.Module,
         optimizer: Optional[torch.optim.Optimizer] = None,
+        epochs: int = 100,
+        lr: float = 2e-4,
+        weight_decay: float = 1e-5,
+        use_amp: bool = True,
+        checkpoint_dir: str = "checkpoints",
+        max_checkpoints: int = 5,
         saver: Optional[CheckpointSaver] = None,
         logger: Optional[WandbLogger] = None,
         test_loader: Optional[torch.utils.data.DataLoader] = None,
     ):
-        self.device = device
+        # Device
+        self.device = torch.device(device) if isinstance(device, str) else device
 
         # Model
         self.model = model
@@ -45,17 +52,29 @@ class Trainer:
         # Optimizer
         self.optimizer = optimizer if optimizer is not None else torch.optim.AdamW(
             self.model.parameters(),
-            lr=2e-4,
+            lr=lr,
+            weight_decay=weight_decay,
         )
+
+        # Mixed Precision
+        self.use_amp = use_amp
+        self.scaler = GradScaler(enabled=self.use_amp)
+
+        # Training params
+        self.epochs = epochs
 
         # DataLoaders
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
 
-        self.saver = saver if saver is not None else CheckpointSaver(save_dir='checkpoints', max_ckpt=5)
+        # Checkpoint Saver
+        self.saver = saver if saver is not None else CheckpointSaver(
+            save_dir=checkpoint_dir,
+            max_ckpt=max_checkpoints,
+        )
 
-        # Logger
+        # Logger (WandB optional)
         self.logger = logger
         if self.logger is not None:
             self.logger.watch(self.model, log="all", log_freq=200)
@@ -84,7 +103,7 @@ class Trainer:
             if is_train:
                 self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=self.cfg.amp):
+            with autocast(enabled=self.use_amp):
                 pred = self.model(img)
                 loss = self.criterion(pred, tgt)
 
@@ -99,14 +118,15 @@ class Trainer:
             if is_train:
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        return {"loss": total_loss / num_batches}
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        return {"loss": avg_loss}
 
     def train(self, start_epoch: int = 1):
         best_val_loss = float('inf')
         best_epoch = start_epoch - 1
 
-        for epoch in range(start_epoch, self.cfg.epochs + 1):
-            print(f"\n{'─' * 50}\nEpoch {epoch}/{self.cfg.epochs}")
+        for epoch in range(start_epoch, self.epochs + 1):
+            print(f"\n{'─' * 50}\nEpoch {epoch}/{self.epochs}")
 
             # Train phase
             train_metrics = self._run_phase(self.train_loader, is_train=True, phase_name="Train")
@@ -117,6 +137,7 @@ class Trainer:
             print(f"  Train loss: {train_metrics['loss']:.4f}")
             print(f"  Val   loss: {val_metrics['loss']:.4f}")
 
+            # Logging
             if self.logger:
                 self.logger.log({
                     "train/loss": train_metrics["loss"],
@@ -125,6 +146,7 @@ class Trainer:
                     "lr": self.optimizer.param_groups[0]["lr"],
                 })
 
+            # Save checkpoint
             save_dict = {
                 "model": self.model,
                 "optimizer": self.optimizer,
@@ -141,6 +163,7 @@ class Trainer:
                 best_epoch = epoch
                 print(f"  → Best val loss updated: {best_val_loss:.4f} (epoch {epoch})")
 
+        # Test nếu có test_loader
         if self.test_loader is not None:
             test_metrics = self._run_phase(self.test_loader, is_train=False, phase_name="Test")
             print(f"  Test loss: {test_metrics['loss']:.4f}")
@@ -151,7 +174,7 @@ class Trainer:
 
     def resume_from_checkpoint(self, ckpt_path: str) -> int:
         """
-        Load checkpoint và trả về epoch tiếp theo.
+        Load checkpoint và trả về epoch tiếp theo để tiếp tục train.
         """
         checkpoint = self.saver.load(
             ckpt_path=ckpt_path,
@@ -161,5 +184,5 @@ class Trainer:
             }
         )
         loaded_epoch = checkpoint.get("epoch", 0)
-        print(f"Resumed from: {ckpt_path} | epoch {loaded_epoch}")
+        print(f"Resumed from: {ckpt_path} | starting from epoch {loaded_epoch + 1}")
         return loaded_epoch + 1
