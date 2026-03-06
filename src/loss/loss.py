@@ -1,14 +1,18 @@
-# src/loss/loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_msssim import ssim  # hoặc ms_ssim nếu bạn dùng multi-scale
+import numpy as np
 
-def charbonnier_loss(pred, target, epsilon=1e-3):
-    """Robust L1 loss (Charbonnier)"""
-    diff = pred - target
-    return torch.mean(torch.sqrt(diff**2 + epsilon**2))
+from pytorch_msssim import ssim
 
+class CharbonnierLoss(nn.Module):
+    def __init__(self, epsilon=1e-3):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, pred, target):
+        diff = pred - target
+        return torch.mean(torch.sqrt(diff**2 + self.epsilon**2))
 
 def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
     """
@@ -28,78 +32,159 @@ def axis_aligned_geometric_loss(pred_bm, target_bm, weight=0.1):
     return weight * (loss_x + loss_y)
 
 
+
+def curvature_consistency_loss(pred_bm, gt_bm, line_points, eps=1e-4):
+    """
+    Curvature loss như Eq.5-6.
+    line_points: tensor (N, 2) hoặc list points trên line elements (giả sử đã project)
+    Thực tế cần bilinear sample tại points → dùng grid_sample hoặc interpolate
+    Ở đây giả lập đơn giản (thay bằng implement chính xác nếu có line_points thật)
+    """
+    # Giả lập: flatten và tính curvature trên toàn map (approximation cho test)
+    # Thực tế: sample tại line points như paper
+    def compute_curvature(bm):
+        # Central difference cho derivative
+        dx = bm[:, :, :, 1:] - bm[:, :, :, :-1]
+        dy = bm[:, :, 1:, :] - bm[:, :, :-1, :]
+        ddx = dx[:, :, :, 1:] - dx[:, :, :, :-1]
+        ddy = dy[:, :, 1:, :] - dy[:, :, :-1, :]
+
+        # Pad để khớp size
+        ddx = F.pad(ddx, (0, 1, 0, 0))
+        ddy = F.pad(ddy, (0, 0, 0, 1))
+
+        num = torch.abs(dx * ddy - dy * ddx)
+        den = (dx**2 + dy**2).pow(1.5) + eps
+        kappa = num / den
+        return kappa.mean()
+
+    kappa_pred = compute_curvature(pred_bm)
+    kappa_gt = compute_curvature(gt_bm)
+    return torch.abs(kappa_pred - kappa_gt)
+
 def ssim_loss(pred, target, data_range=1.0):
     """1 - SSIM loss"""
     return 1.0 - ssim(pred, target, data_range=data_range, size_average=True)
 
+def pde_biharmonic_residual(u):
+    """
+    Tính residual của biharmonic equation: ∇⁴u ≈ 0
+    u: displacement field (B, 2, H, W) - backward map
+    Trả về mean squared residual
+    """
+    def second_deriv(f, dim):
+        # Central difference cho đạo hàm bậc 2
+        if dim == 2:  # theo height
+            d1 = f[:, :, 2:, :] - 2 * f[:, :, 1:-1, :] + f[:, :, :-2, :]
+            d2 = f[:, :, :, 2:] - 2 * f[:, :, :, 1:-1] + f[:, :, :, :-2]
+        else:  # theo width
+            d1 = f[:, :, :, 2:] - 2 * f[:, :, :, 1:-1] + f[:, :, :, :-2]
+            d2 = f[:, :, 2:, :] - 2 * f[:, :, 1:-1, :] + f[:, :, :-2, :]
+        # Pad để khớp size
+        pad = (0, 0, 0, 0) if dim == 2 else (1, 1, 0, 0)
+        return F.pad(d1, pad), F.pad(d2, pad)
 
-def unwarp(img, bm):
-    """
-    Unwarp ảnh warped bằng backward map bm.
-    bm: (B, 2, H, W) - normalized grid [-1, 1] hoặc [0, 1] tùy dataset
-    img: (B, 3, H, W)
-    Trả về ảnh được warp ngược (straightened image)
-    """
-    # Tạo grid từ backward map
-    grid = bm.permute(0, 2, 3, 1)  # (B, H, W, 2)
-    
-    # Nếu bm ở range [-1,1], giữ nguyên
-    # Nếu bm ở range [0,1], scale về [-1,1]: grid = grid * 2 - 1
-    
-    # Giả sử bm đã ở [-1,1] (từ model tanh)
-    return F.grid_sample(
-        img,
-        grid,
-        mode='bilinear',
-        padding_mode='border',
-        align_corners=True
-    )
-    
-class Doc3DDewarpLoss(nn.Module):
-    def __init__(self, bm_recon_weight=1.0, axis_weight=0.1, re_weight=1.0, ssim_weight=0.1):
+    ux = u[:, 0:1]  # dx channel
+    uy = u[:, 1:2]  # dy channel
+
+    # Laplacian ∇²u
+    lap_ux_x, lap_ux_y = second_deriv(ux, 2), second_deriv(ux, 3)
+    lap_uy_x, lap_uy_y = second_deriv(uy, 2), second_deriv(uy, 3)
+    lap_ux = lap_ux_x + lap_ux_y
+    lap_uy = lap_uy_x + lap_uy_y
+
+    # ∇⁴u = ∇²(∇²u)
+    laplap_ux_x, laplap_ux_y = second_deriv(lap_ux, 2), second_deriv(lap_ux, 3)
+    laplap_uy_x, laplap_uy_y = second_deriv(lap_uy, 2), second_deriv(lap_uy, 3)
+    laplap_ux = laplap_ux_x + laplap_ux_y
+    laplap_uy = laplap_uy_x + laplap_uy_y
+
+    residual = laplap_ux**2 + laplap_uy**2
+    return torch.mean(residual)
+
+class DewarpLoss(nn.Module):
+    def __init__(
+        self,
+        lambda_recon=1.0,
+        lambda_bm_recon=1.0,
+        lambda_ssim=0.1,
+        lambda_axis=0.1,
+        lambda_curv=0.05,
+        lambda_pde=0.01,
+
+    ):
         super().__init__()
-        self.bm_recon_weight = bm_recon_weight
-        self.axis_weight = axis_weight
-        self.re_weight = re_weight
-        self.ssim_weight = ssim_weight
+        
+        self.lambda_recon = lambda_recon
+        self.lambda_bm_recon = lambda_bm_recon
+        self.lambda_ssim = lambda_ssim
+        self.lambda_axis = lambda_axis
+        self.lambda_curv = lambda_curv
+        self.lambda_pde = lambda_pde
 
-    def forward(self, pred_bm, bm, warped_img):
-        """
-        pred_bm: dự đoán backward map từ model (B, 2, H_img, W_img)
-        bm: target backward map từ dataset (B, 2, H_bm, W_bm) → sẽ resize lên
-        warped_img: ảnh input bị warp (B, 3, H_img, W_img)
-        """
-        # Resize target bm lên size của pred_bm
-        bm_resized = F.interpolate(
-            bm,
+        self.charbonnier = CharbonnierLoss()
+
+    def forward(
+        self,
+        pred_img,
+        gt_img,
+        pred_bm,
+        gt_bm,
+        line_points=None
+    ):
+
+        # Reconstruction loss
+        l_recon = self.charbonnier(pred_img, gt_img)
+
+        # SSIM loss
+        l_ssim = 1 - ssim(pred_img, gt_img, data_range=1.0, size_average=True)
+
+        # BM reconstruction
+        gt_bm_up = F.interpolate(
+            gt_bm,
             size=pred_bm.shape[2:],
-            mode='bilinear',
+            mode="bilinear",
             align_corners=True
         )
 
-        # BM loss
-        bm_recon_loss = charbonnier_loss(pred_bm, bm_resized)
-        bm_axis_loss = self.axis_weight * axis_aligned_geometric_loss(pred_bm, bm_resized)
-        bm_loss = bm_recon_loss + bm_axis_loss
+        l_bm = self.charbonnier(pred_bm, gt_bm_up)
 
-        # Restoration loss
-        pred_unwarped = unwarp(warped_img, pred_bm)
-        target_unwarped = unwarp(warped_img, bm_resized)
-        
-        img_recon_loss = charbonnier_loss(pred_unwarped, target_unwarped)
-        img_ssim_loss = self.ssim_weight * ssim_loss(pred_unwarped, target_unwarped)
-        
-        re_loss = img_recon_loss + img_ssim_loss
+        # Axis aligned
+        l_axis = axis_aligned_geometric_loss(pred_bm, gt_bm_up)
 
-        # Tổng loss (có thể điều chỉnh trọng số)
-        total_loss = self.bm_recon_weight * bm_loss + self.re_weight * re_loss
-        
-        # Optional: trả về chi tiết để log
-        return total_loss, {
-            'bm_loss': bm_loss.item(),
-            'bm_recon': bm_recon_loss.item(),
-            'bm_axis': bm_axis_loss.item(),
-            're_loss': re_loss.item(),
-            'img_recon': img_recon_loss.item(),
-            'img_ssim': img_ssim_loss.item()
+        # PDE smoothness
+        l_pde = pde_biharmonic_residual(pred_bm)
+
+        # Curvature
+        l_curv = 0
+        if line_points is not None:
+            l_curv = curvature_consistency_loss(pred_bm, gt_bm_up, line_points)
+
+        # Total loss
+        total = (
+            self.lambda_recon * l_recon
+            + self.lambda_ssim * l_ssim
+            + self.lambda_bm_recon * l_bm
+            + self.lambda_axis * l_axis
+            + self.lambda_pde * l_pde
+            + self.lambda_curv * l_curv
+        )
+
+        return total, {
+            "recon": l_recon.item(),
+            "ssim": l_ssim.item(),
+            "bm": l_bm.item(),
+            "axis": l_axis.item(),
+            "pde": l_pde.item(),
+            "curv": float(l_curv)
         }
+
+def build_loss():
+    return DewarpLoss(
+        lambda_recon=1.0,
+        lambda_ssim=0.1,
+        lambda_bm_recon=1.0,
+        lambda_axis=0.1,
+        lambda_pde=0.01,
+        lambda_curv=0.05
+    )
