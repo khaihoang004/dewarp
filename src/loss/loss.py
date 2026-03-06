@@ -111,8 +111,8 @@ def curvature_consistency_loss(
         ddx = dx[:, :, :, 1:] - dx[:, :, :, :-1]     # (B, 2, H, W-2)
         ddy = dy[:, :, 1:, :] - dy[:, :, :-1, :]     # (B, 2, H-2, W)
         
-        ddx = F.pad(ddx, (0, 2, 0, 0), mode='replicate')  # pad right +2 -> W
-        ddy = F.pad(ddy, (0, 0, 2, 0), mode='replicate')  # pad bottom +2 -> H
+        ddx = F.pad(ddx, (0, 1, 0, 0), mode='replicate')  # pad right +1 -> W
+        ddy = F.pad(ddy, (0, 0, 1, 0), mode='replicate')  # pad bottom +1 -> H
         
         num = torch.abs(dx * ddy - dy * ddx)
         den = (dx**2 + dy**2).pow(1.5) + eps
