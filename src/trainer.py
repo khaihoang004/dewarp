@@ -1,4 +1,3 @@
-# src/trainer.py
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
@@ -7,22 +6,10 @@ from pathlib import Path
 from typing import Optional, Dict
 import torch.nn.functional as F
 import numpy as np
+
 from src.training_utils.checkpoint_saver import CheckpointSaver
 from src.training_utils.wandb import WandbLogger
-
-def unwarp(img: torch.Tensor, bm: torch.Tensor) -> torch.Tensor:
-    """
-    Unwarp ảnh bằng backward map.
-    bm: (B, 2, H, W) range [-1,1]
-    """
-    grid = bm.permute(0, 2, 3, 1)  # (B, H, W, 2)
-    return F.grid_sample(
-        img,
-        grid,
-        mode='bilinear',
-        padding_mode='border',
-        align_corners=True
-    )
+from src.utils.unwarp import unwarp
     
 class Trainer:
     """
