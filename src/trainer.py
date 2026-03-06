@@ -105,7 +105,7 @@ class Trainer:
 
             with autocast(enabled=self.use_amp):
                 pred = self.model(img)
-                loss = self.criterion(pred, tgt)
+                loss, loss_dict = self.criterion(pred, tgt, img)
 
             if is_train:
                 self.scaler.scale(loss).backward()
