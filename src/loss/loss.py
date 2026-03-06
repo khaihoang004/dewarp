@@ -116,37 +116,26 @@ def ssim_loss(pred, target, data_range=1.0):
     return 1.0 - ssim(pred, target, data_range=data_range, size_average=True)
 
 def pde_biharmonic_residual(u):
-    """
-    Tính residual của biharmonic equation: ∇⁴u ≈ 0
-    u: displacement field (B, 2, H, W) - backward map
-    Trả về mean squared residual
-    """
     def second_deriv(f, dim):
-        # Central difference cho đạo hàm bậc 2
-        if dim == 2:  # theo height
-            d1 = f[:, :, 2:, :] - 2 * f[:, :, 1:-1, :] + f[:, :, :-2, :]
-            d2 = f[:, :, :, 2:] - 2 * f[:, :, :, 1:-1] + f[:, :, :, :-2]
-        else:  # theo width
-            d1 = f[:, :, :, 2:] - 2 * f[:, :, :, 1:-1] + f[:, :, :, :-2]
-            d2 = f[:, :, 2:, :] - 2 * f[:, :, 1:-1, :] + f[:, :, :-2, :]
-        # Pad để khớp size
-        pad = (0, 0, 0, 0) if dim == 2 else (1, 1, 0, 0)
-        return F.pad(d1, pad), F.pad(d2, pad)
+        # f: (B, C, H, W)
+        if dim == 2:  # Đạo hàm bậc 2 theo Height (y)
+            d = f[:, :, 2:, :] - 2 * f[:, :, 1:-1, :] + f[:, :, :-2, :]
+            return F.pad(d, (0, 0, 1, 1)) # Pad 2 đầu Height
+        elif dim == 3:  # Đạo hàm bậc 2 theo Width (x)
+            d = f[:, :, :, 2:] - 2 * f[:, :, :, 1:-1] + f[:, :, :, :-2]
+            return F.pad(d, (1, 1, 0, 0)) # Pad 2 đầu Width
+        return 0
 
-    ux = u[:, 0:1]  # dx channel
-    uy = u[:, 1:2]  # dy channel
+    ux = u[:, 0:1]
+    uy = u[:, 1:2]
 
-    # Laplacian ∇²u
-    lap_ux_x, lap_ux_y = second_deriv(ux, 2), second_deriv(ux, 3)
-    lap_uy_x, lap_uy_y = second_deriv(uy, 2), second_deriv(uy, 3)
-    lap_ux = lap_ux_x + lap_ux_y
-    lap_uy = lap_uy_x + lap_uy_y
+    # Laplacian ∇²u = u_xx + u_yy
+    lap_ux = second_deriv(ux, 2) + second_deriv(ux, 3)
+    lap_uy = second_deriv(uy, 2) + second_deriv(uy, 3)
 
-    # ∇⁴u = ∇²(∇²u)
-    laplap_ux_x, laplap_ux_y = second_deriv(lap_ux, 2), second_deriv(lap_ux, 3)
-    laplap_uy_x, laplap_uy_y = second_deriv(lap_uy, 2), second_deriv(lap_uy, 3)
-    laplap_ux = laplap_ux_x + laplap_ux_y
-    laplap_uy = laplap_uy_x + laplap_uy_y
+    # Biharmonic ∇⁴u = ∇²(∇²u)
+    laplap_ux = second_deriv(lap_ux, 2) + second_deriv(lap_ux, 3)
+    laplap_uy = second_deriv(lap_uy, 2) + second_deriv(lap_uy, 3)
 
     residual = laplap_ux**2 + laplap_uy**2
     return torch.mean(residual)
@@ -207,20 +196,17 @@ class DewarpLoss(nn.Module):
         l_pde = pde_biharmonic_residual(pred_bm)
 
         # Curvature
-        l_curv = 0
-        if line_points is not None:
-            l_curv = curvature_consistency_loss(pred_bm, gt_bm_up, line_points)
-        
-        l_curv = 0.0
+        l_curv = torch.tensor(0.0, device=pred_bm.device)
         if self.lambda_curv > 0:
-            reader = self.ocr_reader
-            if reader is not None:
+            if line_points is not None:
+                l_curv = curvature_consistency_loss(pred_bm, gt_bm_up, line_points=line_points)
+            elif warped_img_np is not None:
                 l_curv = curvature_consistency_loss(
                     pred_bm, gt_bm_up,
                     warped_img_np=warped_img_np,
-                    line_points=line_points,
-                    ocr_reader=reader
+                    ocr_reader=self.ocr_reader
                 )
+
         # Total loss
         total = (
             self.lambda_recon * l_recon
