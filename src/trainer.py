@@ -118,7 +118,7 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=self.use_amp):
-                pred_bm = self.model(img)
+                pred_bm, pred_mask = self.model(img)
                 
                 pred_unwarped = unwarp(img, pred_bm)
                 gt_unwarped = unwarp(img, tgt)
@@ -242,7 +242,7 @@ class Trainer:
             tgt = batch[1][:4].to(self.device)
 
             with autocast(enabled=self.use_amp):
-                pred_bm = self.model(img)
+                pred_bm, _ = self.model(img)
                 pred_unwarped = unwarp(img, pred_bm)
                 gt_unwarped = unwarp(img, tgt)
 
@@ -258,7 +258,7 @@ class Trainer:
 
             viz_list = []
             for i in range(len(imgs_np)):
-                # Ghép 3 ảnh theo chiều ngang: Gốc | Dự đoán | Đích
+                # Ghép 3 ảnh theo chiều ngang: Original | Prediction | GT
                 combined = np.concatenate([imgs_np[i], preds_np[i], gts_np[i]], axis=1)
                 viz_list.append(combined)
 
