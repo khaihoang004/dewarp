@@ -36,13 +36,13 @@ class DewarpLoss(nn.Module):
         return total_loss
 
 
-def build_loss(cfg):
+def build_loss():
     """
     Factory để tạo loss từ config.
     Bạn có thể thêm tham số alpha/beta vào config sau nếu muốn tune.
     """
     return DewarpLoss(
-        alpha=getattr(cfg, 'loss_alpha', 1.0),
-        beta=getattr(cfg, 'loss_beta', 1.0),
-        data_range=2.0 if getattr(cfg, 'backward_map_range', 'tanh') == 'tanh' else 1.0
+        alpha=1.0,
+        beta=1.0,
+        data_range=2.0
     )
