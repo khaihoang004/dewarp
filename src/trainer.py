@@ -230,7 +230,7 @@ class Trainer:
             img = batch[0][:4].to(self.device)  # Lấy tối đa 4 ảnh để visualize
             tgt = batch[1][:4].to(self.device)
 
-            with autocast(enabled=self.use_amp):
+            with autocast(device_type='cuda', enabled=self.use_amp):
                 pred_bm, _ = self.model(img)
                 pred_unwarped = unwarp(img, pred_bm)
                 gt_unwarped = unwarp(img, tgt)
