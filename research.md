@@ -32,7 +32,11 @@ DocPINN: A Neural PDE-Based Framework for Document Image Dewarping|Thêm physics
 
 ||Key points| Note| Link|
 |---|---|---|---|
-|EDSR|||[Link](https://arxiv.org/abs/1707.02921)|
+|Depthwise Separable Convolution|||https://arxiv.org/pdf/1610.02357
+|Boosting Convolutional Neural Networks with Middle Spectrum Grouped Convolution|||https://arxiv.org/pdf/2304.06305|
+|Lighten CARAFE:Dynamic Lightweight Upsampling with Guided Reassemble Kernels|||https://arxiv.org/pdf/2410.22139|
+|EDSR||SuperResolution|[Link](https://arxiv.org/abs/1707.02921)|
+|EDSR||SuperResolution|[Link](https://arxiv.org/abs/1707.02921)|
 |WDSR-A|||[Link](https://arxiv.org/abs/1808.08718)|
 |Lightweight Image Enhancement Network for Mobile Devices Using Self-Feature Extraction and Dense Modulation|~300k param, chuyên mobile (super-res + noise removal + old-photo restoration).|Điểm hay: Self-Feature Extraction (tự lấy modulation map từ input) + Dense Modulation Block (kết hợp dense connection + pixel-wise modulation). Rất phù hợp thay thế/enhance block deep của bạn để giữ chi tiết chữ (text sharpness) mà không bị over-smooth.|[Link](https://arxiv.org/abs/2205.00853)|
 |DocEnTr|||[Link](https://arxiv.org/abs/2201.10252)|
@@ -47,3 +51,6 @@ DocPINN: A Neural PDE-Based Framework for Document Image Dewarping|Thêm physics
 - Dùng perceptual loss + synthetic illumination augmentation
 - DocEnTr:  -> Self-attention capture long-range dependency (rất tốt cho text layout).
             -> hybrid CNN-Transformer (thêm lightweight transformer block sau HDPA) mà không mất nhẹ.
+-PreP-OCR:  -> image enhancement model học để tối ưu OCR, không phải PSNR.
+            -> Stage 1 — Document Image Restoration -> Stage 2 — Post-OCR Correction: Dùng ByT5: ByT5 hoạt động byte-level, nên: xử lý lỗi ký tự tốt, không phụ thuộc tokenizer.
+            -> Multi-directional patch processing
