@@ -1,5 +1,7 @@
 https://github.com/fh2019ustc/Awesome-Document-Image-Rectification
 
+# Dewarp
+
 ||Key points| Note| Link|
 |---|---|---|---|
 DewarpNet | refinement network | | |
@@ -23,3 +25,25 @@ ForCenNet: Foreground-Centric Network for Document Image Rectification|||https:/
 DocAttentionRect: Attention-Guided Document Image Rectification|||https://bmva-archive.org.uk/bmvc/2025/assets/papers/Paper_39/paper.pdf
 DocCPLNet: Document Image Rectification via Control Point and Illumination Correction|||https://pmc.ncbi.nlm.nih.gov/articles/PMC12567372/
 DocPINN: A Neural PDE-Based Framework for Document Image Dewarping|Thêm physics constraint (smoothness, curvature prior) vào loss.||https://dl.acm.org/doi/10.1007/978-3-032-04627-7_22
+
+
+# Refine
+## Paper Related
+
+||Key points| Note| Link|
+|---|---|---|---|
+|EDSR|||[Link](https://arxiv.org/abs/1707.02921)|
+|WDSR-A|||[Link](https://arxiv.org/abs/1808.08718)|
+|Lightweight Image Enhancement Network for Mobile Devices Using Self-Feature Extraction and Dense Modulation|~300k param, chuyên mobile (super-res + noise removal + old-photo restoration).|Điểm hay: Self-Feature Extraction (tự lấy modulation map từ input) + Dense Modulation Block (kết hợp dense connection + pixel-wise modulation). Rất phù hợp thay thế/enhance block deep của bạn để giữ chi tiết chữ (text sharpness) mà không bị over-smooth.|[Link](https://arxiv.org/abs/2205.00853)|
+|DocEnTr|||[Link](https://arxiv.org/abs/2201.10252)|
+
+
+
+## Methodology
+- hybrid attention + multi-task OCR-guided loss → hướng refine HDPA + FST
+- EDSR: -> rất mạnh trong việc reconstruct high-frequency information
+        -> Bỏ BatchNorm, do BatchNorm đôi khi: làm thay đổi distribution pixel và gây mất contrast -> Bỏ BatchNorm giúp: giữ pixel fidelity, giữ sharp contrast giữa chữ và nền
+- WDSR-A: bản cải thiện của EDSR
+- Dùng perceptual loss + synthetic illumination augmentation
+- DocEnTr:  -> Self-attention capture long-range dependency (rất tốt cho text layout).
+            -> hybrid CNN-Transformer (thêm lightweight transformer block sau HDPA) mà không mất nhẹ.
