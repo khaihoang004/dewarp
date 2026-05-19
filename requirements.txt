@@ -4,3 +4,14 @@ hdf5storage
 h5py
 albumentations
 pytorch_msssim
+torch>=2.0
+torchvision>=0.15
+
+numpy
+opencv-python
+Pillow
+tqdm
+
+matplotlib
+fvcore
+pytest
