@@ -9,7 +9,7 @@ Bộ test tổng hợp cho:
 4. Early Exit
 5. Gradient flow
 6. ACT halting weights
-7. Decode from bottleneck
+7. Internal _decode func
 8. FLOPs / Params / Latency benchmark
 
 Chạy:
@@ -125,10 +125,10 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
 
         (
             output,
-            layer_outputs,
+            intermediate_preds,
             halting_weights,
             halt_logits
-        ) = self.model(self.input)
+        ) = self.model(self.input, return_all=True)
 
         self.assertEqual(
             output.shape,
@@ -136,7 +136,7 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
         )
 
         self.assertEqual(
-            len(layer_outputs),
+            len(intermediate_preds),
             self.max_loops
         )
 
@@ -151,34 +151,34 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
         )
 
     # =====================================================
-    # bottleneck shape
+    # intermediate preds shape
     # =====================================================
 
-    def test_bottleneck_shapes(self):
+    def test_intermediate_preds_shapes(self):
 
         self.model.train()
 
         (
             output,
-            layer_outputs,
+            intermediate_preds,
             halting_weights,
             halt_logits
-        ) = self.model(self.input)
+        ) = self.model(self.input, return_all=True)
 
         expected_shape = (
             1,
-            self.base_dim * 4,
-            32,
-            32
+            3,
+            256,
+            256
         )
 
-        for h in layer_outputs:
-            self.assertEqual(h.shape, expected_shape)
+        for p in intermediate_preds:
+            self.assertEqual(p.shape, expected_shape)
 
         for w in halting_weights:
             self.assertEqual(
                 w.shape,
-                (1,)
+                (1,)  # Batch size = 1
             )
 
     # =====================================================
@@ -191,10 +191,10 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
 
         (
             output,
-            layer_outputs,
+            _,
             halting_weights,
             halt_logits
-        ) = self.model(self.input)
+        ) = self.model(self.input, return_all=False)
 
         weights = halting_weights
 
@@ -216,7 +216,6 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
         self.model.eval()
 
         with torch.no_grad():
-
             output = self.model(self.input)
 
         self.assertIsInstance(
@@ -238,7 +237,6 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
         self.model.eval()
 
         with torch.no_grad():
-
             output = self.model(self.input)
 
         self.assertTrue(
@@ -305,10 +303,10 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
 
         (
             output,
-            layer_outputs,
+            intermediate_preds,
             halting_weights,
             halt_logits
-        ) = self.model(self.input)
+        ) = self.model(self.input, return_all=True)
 
         loss = output.mean()
 
@@ -325,10 +323,10 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
         self.assertTrue(has_grad)
 
     # =====================================================
-    # decode from bottleneck
+    # internal decode function
     # =====================================================
 
-    def test_decode_from_bottleneck(self):
+    def test_internal_decode(self):
 
         self.model.eval()
 
@@ -346,7 +344,7 @@ class TestLoopRepDocEnhanceNet(unittest.TestCase):
 
             bottleneck_out = self.model.bottleneck(e3)
 
-            output = self.model.decode_from_bottleneck(
+            output = self.model._decode(
                 bottleneck_out,
                 skip1,
                 skip2,

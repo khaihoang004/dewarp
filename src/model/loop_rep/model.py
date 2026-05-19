@@ -254,7 +254,29 @@ class LoopRepDocEnhanceNet(nn.Module):
         # Output Head: Dự đoán phần dư toàn cục (Global Residual Mapping)
         self.final_head = nn.Conv2d(base_dim, 3, kernel_size=3, padding=1)
 
-    def forward(self, x):
+
+    def _decode(
+        self,
+        bottleneck_feat,
+        skip1,
+        skip2,
+        skip3,
+        x_ori
+    ):
+
+        d3 = self.dec3(bottleneck_feat, skip3)
+
+        d2 = self.dec2(d3, skip2)
+
+        d1 = self.dec1(d2, skip1)
+
+        residual = self.final_head(d1)
+
+        output = x_ori + residual
+
+        return output
+
+    def forward(self, x, return_all=False):
         x_ori = x # Giữ lại ảnh gốc đầu vào
         
         # --- ENCODER PATH ---
@@ -276,27 +298,42 @@ class LoopRepDocEnhanceNet(nn.Module):
             b_out = self.bottleneck(e3)
             
         # --- DECODER PATH ---
-        d3 = self.dec3(b_out, skip3)
-        d2 = self.dec2(d3, skip2)
-        d1 = self.dec1(d2, skip1)
-        
-        # --- RECONSTRUCTION ---
-        residual = self.final_head(d1)
-        
-        output = x_ori + residual
-        
-        if self.training:
+        output = self._decode(
+            b_out,
+            skip1,
+            skip2,
+            skip3,
+            x_ori
+        )
+        if not self.training:
+            output = torch.clamp(output, 0.0, 1.0)
+            return output
 
-            return (
-                output,
-                layer_outputs,
-                halting_weights,
-                halt_logits
-            )
+        intermediate_preds = None
 
-        output = torch.clamp(output, 0.0, 1.0)
+        if return_all:
+            intermediate_preds = []
 
-        return output
+            for state in layer_outputs:
+                pred_t = self._decode(
+                    state,
+                    skip1,
+                    skip2,
+                    skip3,
+                    x_ori
+                )
+
+                if not self.training:
+                    pred_t = torch.clamp(pred_t, 0.0, 1.0)
+
+                intermediate_preds.append(pred_t)
+
+        return (
+            output,
+            intermediate_preds,
+            halting_weights,
+            halt_logits
+        )
 
     @torch.no_grad()
     def fuse_entire_model(self):
@@ -312,24 +349,3 @@ class LoopRepDocEnhanceNet(nn.Module):
                 fused.append(name)
  
         print(f">>> ĐÃ FUSE {len(fused)} MODULE: {fused}")
-
-    def decode_from_bottleneck(
-        self,
-        bottleneck_feat,
-        skip1,
-        skip2,
-        skip3,
-        x_ori
-    ):
-
-        d3 = self.dec3(bottleneck_feat, skip3)
-
-        d2 = self.dec2(d3, skip2)
-
-        d1 = self.dec1(d2, skip1)
-
-        residual = self.final_head(d1)
-
-        output = x_ori + residual
-
-        return torch.clamp(output, 0.0, 1.0)
