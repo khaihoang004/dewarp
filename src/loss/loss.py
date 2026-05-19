@@ -13,7 +13,7 @@ class CharbonnierLoss(nn.Module):
 
 
 class Stage1Loss(nn.Module):
-    def __init__(self, prior_weight=0.001, alpha=0.84):
+    def __init__(self, prior_weight=0.005, alpha=0.84):
         super().__init__()
         self.prior_weight = prior_weight
         self.alpha = alpha
@@ -21,12 +21,15 @@ class Stage1Loss(nn.Module):
 
     def reconstruction_loss(self, pred, target):
         charbonnier_loss = self.charbonnier(pred, target)
-        ms_ssim_loss = 1.0 - ms_ssim(
-            pred, target, data_range=1.0, size_average=True
-        )
-        combined_loss = self.alpha * charbonnier_loss + (1.0 - self.alpha) * ms_ssim_loss
         
-        # Trả về cả combined và các loss thành phần
+        pred_safe = torch.clamp(pred, 0.0, 1.0).float()
+        target_safe = target.float()
+
+        ms_ssim_loss = 1.0 - ms_ssim(
+            pred_safe, target_safe, data_range=1.0, size_average=True
+        )
+        
+        combined_loss = self.alpha * charbonnier_loss + (1.0 - self.alpha) * ms_ssim_loss
         return combined_loss, charbonnier_loss, ms_ssim_loss
 
     def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwargs):
@@ -42,13 +45,10 @@ class Stage1Loss(nn.Module):
         for t in range(T):
             pred_t = intermediate_preds[t]
             rec_loss_t, charb_t, msssim_t = self.reconstruction_loss(pred_t, target)
-            
-            weight_t = halting_weights[t].mean()
-            
-            # Nhân với halting_weights giống như thuật toán đề xuất
-            total_rec_loss += (weight_t * rec_loss_t)
-            total_charb_loss += (weight_t * charb_t)
-            total_msssim_loss += (weight_t * msssim_t)
+
+            total_rec_loss += (rec_loss_t / T)
+            total_charb_loss += (charb_t / T)
+            total_msssim_loss += (msssim_t / T)
 
         # =====================================
         # uniform prior KL
@@ -56,7 +56,7 @@ class Stage1Loss(nn.Module):
         prior = torch.full_like(halting_weights, 1.0 / T)
         
         kl_loss = F.kl_div(
-            torch.log(halting_weights + 1e-8),
+            torch.log(halting_weights + 1e-6),
             prior,
             reduction='batchmean'
         )
@@ -88,8 +88,12 @@ class Stage2Loss(nn.Module):
 
     def reconstruction_loss(self, pred, target):
         charbonnier_loss = self.charbonnier(pred, target)
+        
+        pred_safe = torch.clamp(pred, 0.0, 1.0).float()
+        target_safe = target.float()
+
         ms_ssim_loss = 1.0 - ms_ssim(
-            pred, target, data_range=1.0, size_average=True
+            pred_safe, target_safe, data_range=1.0, size_average=True
         )
         combined_loss = self.alpha * charbonnier_loss + (1.0 - self.alpha) * ms_ssim_loss
         return combined_loss, charbonnier_loss, ms_ssim_loss
