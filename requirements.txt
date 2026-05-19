@@ -15,3 +15,6 @@ tqdm
 matplotlib
 fvcore
 pytest
+thop
+wandb
+ptflops
