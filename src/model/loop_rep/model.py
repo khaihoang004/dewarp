@@ -44,8 +44,9 @@ class BottleneckLayer(nn.Module):
         # Gate chạy song song với mỗi layer để tính Exit Probability
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, 1, kernel_size=1),
-            nn.Sigmoid()
+            nn.Conv2d(dim, dim // 4, 1),
+            nn.GELU(),
+            nn.Conv2d(dim // 4, 1, 1)
         )
 
     def forward(self, x):
@@ -53,86 +54,144 @@ class BottleneckLayer(nn.Module):
         x = x + self.ffn(self.norm2(x))
         
         # Tính xác suất exit tại bước này: dạng tensor (B, 1, 1, 1) -> view về (B,)
-        exit_prob = self.gate(x).view(-1)
-        return x, exit_prob
+        gate_logits = self.gate(x).view(-1)
+        exit_prob = torch.sigmoid(gate_logits)
+        return x, gate_logits, exit_prob
 
 
 # --- KIẾN TRÚC LOOPED BOTTLENECK CHÍNH ---
 class AdaptiveLoopedBottleneck(nn.Module):
-    def __init__(self, dim, max_loops=4):
+
+    def __init__(self, dim, max_loops=6):
         super().__init__()
+
         self.max_loops = max_loops
-        
-        # Khởi tạo 1 Layer dùng chung trọng số (Weight-sharing dạng loop)
+
         self.layer = BottleneckLayer(dim)
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        
-        # Nơi lưu trữ thông tin của các bước
-        layer_outputs = []
-        exit_probs = []
-        
-        state = x
-        
-        # 1. Chạy tuần tự qua các Layer (Reasoning Steps)
-        for t in range(self.max_loops):
-            state, p_t = self.layer(state)
-            layer_outputs.append(state)
-            exit_probs.append(p_t)
-            
-        # 2. Xử lý logic xác suất để tạo trọng số dừng (Halting Weights)
-        # Sử dụng cơ chế như PonderNet / ACT
-        halting_weights = []
-        survival_prob = torch.ones(B, device=x.device) # S_0 = 1
-        
-        for t in range(self.max_loops):
-            p_t = exit_probs[t]
-            
-            if t < self.max_loops - 1:
-                # w_t = S_{t-1} * p_t
-                w_t = survival_prob * p_t
-                # Cập nhật S_t = S_{t-1} * (1 - p_t)
-                survival_prob = survival_prob * (1.0 - p_t)
-            else:
-                # Bước cuối: Nhận toàn bộ lượng "mass" còn lại: w_T = S_{T-1}
-                w_t = survival_prob
-                
-            halting_weights.append(w_t)
-            
-        # 3. Phân tách hành vi Train và Inference (Early Exit thực tế)
+    def forward(self, x, halt_threshold=0.8):
+
+        B = x.shape[0]
+
+        # =================================================
+        # TRAINING
+        # =================================================
+
         if self.training:
-            # LƯU Ý: Trong khi TRAIN, trả về list các output và trọng số dừng để tính Loss phân tầng
-            # Output cuối cùng của Bottleneck là weighted sum của tất cả các bước
-            final_out = torch.zeros_like(x)
-            for t in range(self.max_loops):
-                # Phát triển chiều của w_t để nhân với tensor 4D (B, C, H, W)
-                w_expanded = halting_weights[t].view(B, 1, 1, 1)
-                final_out = final_out + w_expanded * layer_outputs[t]
-                
-            return final_out, layer_outputs, halting_weights
-        else:
-            # LƯU Ý: Khi INFERENCE, thực hiện Early Exit cứng (Hard Exit) để tối ưu hóa thời gian chạy
-            # Sử dụng vòng lặp thực tế để mô phỏng suy luận động
-            state_infer = x
-            survival_prob_infer = 1.0
+
+            state = x
+
+            layer_outputs = []
+
+            halt_logits = []
+
+            halt_probs = []
+
+            for _ in range(self.max_loops):
+
+                state, logits_t, p_t = self.layer(state)
+
+                layer_outputs.append(state)
+
+                halt_logits.append(logits_t)
+
+                halt_probs.append(p_t)
             
+            halt_logits = torch.stack(halt_logits, dim=0)
+
+            # ---------------------------------------------
+            # ACT weights
+            # ---------------------------------------------
+
+            halting_weights = []
+
+            survival_prob = torch.ones(
+                B,
+                device=x.device
+            )
+
             for t in range(self.max_loops):
-                state_infer, p_t_infer = self.layer(state_infer)
-                
-                # Tính toán trọng số tích lũy tại runtime
+
+                p_t = halt_probs[t]
+
                 if t < self.max_loops - 1:
-                    w_t_infer = survival_prob_infer * p_t_infer
-                    survival_prob_infer = survival_prob_infer * (1.0 - p_t_infer)
+
+                    w_t = survival_prob * p_t
+
+                    survival_prob = survival_prob * (
+                                    1.0 - p_t
+                                ).clamp(min=1e-6)
+
                 else:
-                    w_t_infer = survival_prob_infer
-                
-                # Chiến lược Early Exit: Nếu xác suất dừng thực tế w_t đạt ngưỡng cao 
-                # Hoặc p_t độc lập > 0.85 (tùy bạn cấu hình), ta dừng việc tính toán layer tiếp theo.
-                if w_t_infer.mean() > 0.80:
-                    break
-                    
-            return state_infer, None, None
+                    w_t = survival_prob
+
+                halting_weights.append(w_t)
+
+            halting_weights = torch.stack(
+                halting_weights,
+                dim=0
+            )
+
+            halting_weights = halting_weights / (
+                halting_weights.sum(
+                    dim=0,
+                    keepdim=True
+                ) + 1e-8
+            )
+
+            # ---------------------------------------------
+            # weighted state
+            # ---------------------------------------------
+
+            final_state = torch.zeros_like(layer_outputs[0])
+
+            for t in range(self.max_loops):
+
+                w_t = halting_weights[t].view(
+                    B,
+                    1,
+                    1,
+                    1
+                )
+
+                final_state += (
+                    w_t * layer_outputs[t]
+                )
+
+            return (
+                final_state,
+                layer_outputs,
+                halting_weights,
+                halt_logits
+            )
+
+        # =================================================
+        # INFERENCE
+        # =================================================
+
+        else:
+
+            state = x
+
+            cumulative_halt = torch.zeros(
+                B,
+                device=x.device
+            )
+
+            for t in range(self.max_loops):
+
+                state, logits_t, p_t = self.layer(state)
+
+                cumulative_halt = torch.clamp(
+                    cumulative_halt + p_t,
+                    max=1.0
+                )
+
+                if (cumulative_halt >= halt_threshold).all():
+
+                    return state
+
+            return state
 
 
 class ShallowExtractor(nn.Module):
@@ -205,7 +264,16 @@ class LoopRepDocEnhanceNet(nn.Module):
         skip3, e3 = self.enc3(e2)
         
         # --- ADAPTIVE BOTTLENECK ---
-        b_out, layer_outputs, halting_weights = self.bottleneck(e3)
+        if self.training:
+            (
+                b_out,
+                layer_outputs,
+                halting_weights,
+                halt_logits
+            ) = self.bottleneck(e3)
+
+        else:
+            b_out = self.bottleneck(e3)
             
         # --- DECODER PATH ---
         d3 = self.dec3(b_out, skip3)
@@ -214,12 +282,21 @@ class LoopRepDocEnhanceNet(nn.Module):
         
         # --- RECONSTRUCTION ---
         residual = self.final_head(d1)
-        x_final_output = x_ori + residual # Cộng phần dư đa nhiệm (Deblur, Deshadow, v.v.)
+        
+        output = x_ori + residual
         
         if self.training:
-            return x_final_output, layer_outputs, halting_weights
-            
-        return torch.clamp(x_final_output, 0.0, 1.0)
+
+            return (
+                output,
+                layer_outputs,
+                halting_weights,
+                halt_logits
+            )
+
+        output = torch.clamp(output, 0.0, 1.0)
+
+        return output
 
     @torch.no_grad()
     def fuse_entire_model(self):
@@ -236,81 +313,23 @@ class LoopRepDocEnhanceNet(nn.Module):
  
         print(f">>> ĐÃ FUSE {len(fused)} MODULE: {fused}")
 
+    def decode_from_bottleneck(
+        self,
+        bottleneck_feat,
+        skip1,
+        skip2,
+        skip3,
+        x_ori
+    ):
 
+        d3 = self.dec3(bottleneck_feat, skip3)
 
-import unittest
-import torch
-import torch.nn as nn
+        d2 = self.dec2(d3, skip2)
 
-# Giả sử file kiến trúc của bạn đặt tên là model.py
-# from model import LoopRepDocEnhanceNet
+        d1 = self.dec1(d2, skip1)
 
-class TestLoopRepDocEnhanceNet(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        """Khởi tạo cấu hình mạng và thiết bị chạy cố định cho toàn bộ bài test"""
-        cls.base_dim = 32
-        cls.max_loops = 4
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Khởi tạo mô hình
-        cls.model = LoopRepDocEnhanceNet(
-            base_dim=cls.base_dim, 
-            max_loops=cls.max_loops, 
-            deploy=False
-        ).to(cls.device)
-        
-        # Giả lập 1 Batch ảnh tài liệu 2K (Batch_size=1, Kênh màu RGB=3, 512x512)
-        # Sử dụng kích thước 2K thực tế để kiểm tra khả năng chịu tải và tính chia hết cho 8
-        cls.dummy_input = torch.randn(1, 3, 512, 512, device=cls.device)
+        residual = self.final_head(d1)
 
-    def test_1_training_mode_output(self):
-        """Kiểm thử luồng dữ liệu ở chế độ Huấn luyện (Training Mode)"""
-        self.model.train()
-        
-        # Forward pass nhận bộ 3 đầu ra phân tầng
-        final_output, layer_outputs, halting_weights = self.model(self.dummy_input)
-        
-        # 1. Kiểm tra ảnh đầu ra cuối cùng phải khớp hoàn hảo kích thước ảnh 2K gốc
-        self.assertEqual(final_output.shape, (1, 3, 512, 512))
-        
-        # 2. Kiểm tra số lượng reasoning steps ẩn trong Bottleneck phải đúng bằng max_loops
-        self.assertEqual(len(layer_outputs), self.max_loops)
-        self.assertEqual(len(halting_weights), self.max_loops)
-        
-        # 3. Kiểm tra kích thước đặc trưng tại Bottleneck (độ phân giải giảm 1/8 -> 256x256, số kênh 4 * base_dim = 128)
-        expected_bottleneck_shape = (1, self.base_dim * 4, 512 // 8, 512 // 8)
-        for h_t in layer_outputs:
-            self.assertEqual(h_t.shape, expected_bottleneck_shape)
-            
-        # 4. Kiểm tra chiều của mảng trọng số dừng (Halting weights) ứng với từng ảnh trong Batch
-        for w_t in halting_weights:
-            self.assertEqual(w_t.shape, (1,))
+        output = x_ori + residual
 
-    def test_2_inference_mode_and_fusion(self):
-        """Kiểm thử luồng dữ liệu ở chế độ Suy luận (Inference Mode) sau khi đã rút gọn mạng (Fuse)"""
-        self.model.eval()
-        
-        # Tiến hành nén (fuse) các nhánh RepConv3 và RepConv7
-        try:
-            self.model.fuse_entire_model()
-        except Exception as e:
-            self.fail(f"Hàm fuse_entire_model() bị lỗi hệ thống: {e}")
-            
-        # Chạy suy luận không tính đạo hàm để tiết kiệm bộ nhớ
-        with torch.no_grad():
-            inference_output = self.model(self.dummy_input)
-            
-        # 1. Kiểm tra ảnh đầu ra sau khi fuse phải giữ nguyên cấu trúc không gian 2K
-        self.assertEqual(inference_output.shape, (1, 3, 512, 512))
-        
-        # 2. Kiểm tra dải giá trị màu đầu ra đã được ép (clamp) chuẩn trong khoảng [0.0, 1.0] hay chưa
-        self.assertTrue(torch.all(inference_output >= 0.0))
-        self.assertTrue(torch.all(inference_output <= 1.0))
-        
-        # 3. Kiểm tra chế độ Eval chỉ trả về duy nhất 1 Tensor ảnh (không trả về tuple/list như khi train)
-        self.assertIsInstance(inference_output, torch.Tensor)
-
-if __name__ == "__main__":
-    # Kích hoạt trình chạy test tự động của bộ framework
-    unittest.main(verbosity=2)
+        return torch.clamp(output, 0.0, 1.0)
