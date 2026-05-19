@@ -29,38 +29,23 @@ def compute_ssim(pred, target):
 # =========================================================
 
 def train_one_epoch(
-    model,
-    loader,
-    optimizer,
-    scaler,
-    criterion,
-    device,
-    epoch,
-    cfg,
-    aug=None,
-    stage=1
+    model, loader, optimizer, scaler, criterion, device, epoch, cfg, aug=None, stage=1, global_step=0
 ):
     model.train()
     running_loss = 0.0
 
     pbar = tqdm(loader, desc=f"Train {epoch}")
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         inp = batch["inp"].to(device, non_blocking=True)
         gt = batch["gt"].to(device, non_blocking=True)
 
-        # GPU augmentation
         if aug is not None:
             inp, gt = aug(inp, gt)
 
         optimizer.zero_grad(set_to_none=True)
 
-        # =====================================
-        # FORWARD
-        # =====================================
         with autocast(device_type="cuda", enabled=cfg.use_amp):
-            
-            # Gọi return_all=True để model tự nội suy intermediate_preds
             (
                 pred,
                 intermediate_preds,
@@ -68,20 +53,16 @@ def train_one_epoch(
                 halt_logits
             ) = model(inp, return_all=True)
 
-            # =================================
-            # LOSS COMPUTATION
-            # =================================
-            # Lưu ý: Hàm Loss của bạn cần được tùy biến lại đôi chút
-            # để nhận 'intermediate_preds' thay vì 'layer_outputs' & 'decoder'
+            # Đón cả total_loss và loss_dict từ hàm loss đã cập nhật
             if stage == 1:
-                loss = criterion(
+                loss, loss_dict = criterion(
                     target=gt,
                     final_pred=pred,
                     intermediate_preds=intermediate_preds,
                     halting_weights=halting_weights
                 )
             else:
-                loss = criterion(
+                loss, loss_dict = criterion(
                     target=gt,
                     final_pred=pred,
                     intermediate_preds=intermediate_preds,
@@ -89,39 +70,38 @@ def train_one_epoch(
                     halting_weights=halting_weights
                 )
 
-        # =====================================
-        # BACKWARD
-        # =====================================
         scaler.scale(loss).backward()
-
-        # Gradient clipping
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            cfg.grad_clip
-        )
-
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += loss.item()
 
-        # =====================================
-        # ACT STATS (Adaptive Computation Time)
-        # =====================================
+        # Tính expected steps để hiển thị tqdm và log
         expected_steps = 0.0
-        
-        # Đảm bảo duyệt đúng chiều của halting_weights (ví dụ: [loops, batch])
-        num_loops = halting_weights.size(0)
-        for t in range(num_loops):
+        for t in range(halting_weights.size(0)):
             expected_steps += ((t + 1) * halting_weights[t].mean())
+
+        # ====================================================
+        # LOGGING MỖI 20 BATCH (STEPS) VÀO WANDB
+        # ====================================================
+        if (batch_idx + 1) % 20 == 0:
+            log_data = loss_dict  # Chứa rec_loss, kl_loss, gate_loss... tùy stage
+            log_data["train/step_expected_steps"] = expected_steps.item()
+            log_data["global_step"] = global_step
+            log_data["lr"] = optimizer.param_groups[0]['lr']
+            
+            wandb.log(log_data, step=global_step)
+
+        global_step += 1  # Tăng biến đếm tổng
 
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
             "steps": f"{expected_steps.item():.2f}"
         })
 
-    return running_loss / len(loader)
+    return running_loss / len(loader), global_step
 
 # =========================================================
 # VALIDATE
@@ -188,24 +168,29 @@ def train_loop(
 ):
     scaler = GradScaler(enabled=cfg.use_amp)
     best_psnr = 0.0
+    
+    global_step = 0  # Khởi tạo global_step để theo dõi xuyên suốt các epochs
 
     for epoch in range(cfg.epochs):
         
-        train_loss = train_one_epoch(
+        # Nhận lại global_step từ epoch này để truyền tiếp cho epoch sau
+        train_loss, global_step = train_one_epoch(
             model=model, loader=train_loader, optimizer=optimizer, scaler=scaler,
-            criterion=criterion, device=device, epoch=epoch, cfg=cfg, aug=aug, stage=stage
+            criterion=criterion, device=device, epoch=epoch, cfg=cfg, aug=aug, stage=stage,
+            global_step=global_step
         )
 
         val_psnr, val_ssim, sample_images = validate(model, val_loader, device)
         scheduler.step()
 
+        # Log ở cấp độ Epoch
         wandb.log({
             "epoch": epoch,
-            "train/loss": train_loss,
+            "epoch/train_loss": train_loss,
             "val/psnr": val_psnr,
             "val/ssim": val_ssim,
-            "lr": scheduler.get_last_lr()[0]
-        })
+            "global_step": global_step
+        }, step=global_step)
 
         if sample_images is not None:
             log_images(sample_images, epoch)
