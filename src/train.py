@@ -169,18 +169,6 @@ def train_one_epoch(
 
             model.eval()
 
-            # ---- loop-level logging (IMPORTANT) ----
-            # NHỚ TRUYỀN THÊM halt_logits
-            log_loop_steps(
-                inp=inp,
-                gt=gt,
-                intermediate_preds=intermediate_preds,
-                halting_weights=halting_weights,
-                halt_logits=halt_logits, 
-                global_step=global_step,
-                max_samples=2
-            )
-
             # ---- final prediction logging ----
             B_current = min(inp.size(0), 4) # Log thử 4 ảnh final thôi cho nhẹ
             imgs = []
@@ -230,32 +218,34 @@ def train_one_epoch(
 # =========================================================
 
 @torch.no_grad()
-def validate(model, loader, device):
-
+def validate(model, loader, device, epoch=0):
     model.eval()
 
     psnr_sum, ssim_sum = 0, 0
-    sample = None
 
     for i, batch in enumerate(tqdm(loader, desc="Val")):
-
         inp = batch["inp"].to(device)
         gt = batch["gt"].to(device)
 
-        pred = model(inp)
+        if i == 0:
+            pred, inter_preds, halt_w, halt_logits = model(inp, return_all=True)
+            
+            log_loop_steps(
+                inp=inp,
+                gt=gt,
+                intermediate_preds=inter_preds,
+                halting_weights=halt_w,
+                halt_logits=halt_logits,
+                global_step=epoch, # Dùng epoch làm thanh trượt
+                max_samples=2
+            )
+        else:
+            pred = model(inp)
 
         psnr_sum += compute_psnr(pred, gt)
         ssim_sum += compute_ssim(pred, gt)
 
-        if i == 0:
-            sample = {
-                "input": inp[:2].cpu(),
-                "pred": pred[:2].cpu(),
-                "gt": gt[:2].cpu()
-            }
-
-    return psnr_sum / len(loader), ssim_sum / len(loader), sample
-
+    return psnr_sum / len(loader), ssim_sum / len(loader)
 
 # =========================================================
 # TRAIN LOOP
@@ -266,13 +256,13 @@ def train_loop(
     optimizer, scheduler, criterion,
     device, cfg, aug=None, stage=1
 ):
-
     scaler = GradScaler(enabled=cfg.use_amp)
     best_psnr = 0
     global_step = 0
 
     for epoch in range(cfg.epochs):
 
+        # 1. Train 1 Epoch
         train_loss, global_step = train_one_epoch(
             model, train_loader,
             optimizer, scaler, criterion,
@@ -281,9 +271,11 @@ def train_loop(
             global_step=global_step
         )
 
-        val_psnr, val_ssim, sample = validate(model, val_loader, device)
+        # 2. Validation
+        val_psnr, val_ssim = validate(model, val_loader, device, epoch=epoch)
         scheduler.step()
 
+        # 3. Log Metrics
         wandb.log({
             "epoch": epoch,
             "val/psnr": val_psnr,
@@ -292,6 +284,7 @@ def train_loop(
             "global_step": global_step
         }, step=global_step)
 
+        # 4. Save Model
         if val_psnr > best_psnr:
             best_psnr = val_psnr
             torch.save(model.state_dict(), "best_model.pth")
