@@ -43,6 +43,8 @@ def make_vis(inp, pred, gt):
 
     def to_np(x):
         x = x.detach().float().cpu()
+        if x.dim() == 4:
+            x = x.squeeze(0)
         x = torch.clamp(x, 0, 1)
         return x.permute(1, 2, 0).numpy()
 
@@ -62,54 +64,40 @@ def make_vis(inp, pred, gt):
 # LOOP STEP LOGGER (CORE PART)
 # =========================================================
 
-def log_loop_steps(inp, gt, intermediate_preds, halting_weights, global_step, max_samples=2):
+# Bổ sung halt_logits vào tham số truyền vào
+def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, global_step, max_samples=2):
     """
     Log full loop trajectory per sample
     """
     T = len(intermediate_preds)
-    B = min(inp.size(0), max_samples)
+    B = min(inp.size(0), max_samples) # Chỉ lấy tối đa 2 ảnh
 
     log_dict = {}
 
     for b in range(B):
-
-        imgs = []
-        psnr_curve = []
-        ssim_curve = []
-        rmse_curve = []
-        halt_curve = []
-
+        loop_images = [] # Chứa các ảnh của các bước lặp cho ảnh thứ b
+        
         for t in range(T):
+            # Cắt slicing [b:b+1] để giữ form 4D chuẩn cho MS-SSIM
+            inp_b = inp[b:b+1]
+            pred_t = intermediate_preds[t][b:b+1]
+            gt_b = gt[b:b+1]
 
-            pred_t = intermediate_preds[t][b]
-            vis, metrics = make_vis(inp[b], pred_t, gt[b])
+            vis, metrics = make_vis(inp_b, pred_t, gt_b)
 
-            halt = halting_weights[t][b].mean().item()
+            # Xác suất Exit = sigmoid(logits)
+            exit_prob = torch.sigmoid(halt_logits[t][b]).mean().item()
+            # Trọng số ACT (tổng các bước = 1)
+            act_w = halting_weights[t][b].mean().item()
 
-            imgs.append(
-                wandb.Image(
-                    vis,
-                    caption=f"t={t} | "
-                            f"P={metrics['psnr']:.2f} | "
-                            f"S={metrics['ssim']:.3f} | "
-                            f"R={metrics['rmse']:.4f} | "
-                            f"H={halt:.3f}"
-                )
-            )
+            caption = (f"Loop {t+1}/{T} | Exit Prob: {exit_prob*100:.1f}% | "
+                       f"ACT W: {act_w:.3f} | P={metrics['psnr']:.2f} | S={metrics['ssim']:.3f}")
 
-            psnr_curve.append(metrics["psnr"])
-            ssim_curve.append(metrics["ssim"])
-            rmse_curve.append(metrics["rmse"])
-            halt_curve.append(halt)
+            loop_images.append(wandb.Image(vis, caption=caption))
 
-        log_dict[f"loop/sample_{b}/images"] = imgs
-        log_dict[f"loop/sample_{b}/psnr"] = psnr_curve
-        log_dict[f"loop/sample_{b}/ssim"] = ssim_curve
-        log_dict[f"loop/sample_{b}/rmse"] = rmse_curve
-        log_dict[f"loop/sample_{b}/halt"] = halt_curve
+        log_dict[f"train/sample_{b}_loops"] = loop_images
 
     wandb.log(log_dict, step=global_step)
-
 
 # =========================================================
 # TRAIN ONE EPOCH
@@ -182,22 +170,25 @@ def train_one_epoch(
             model.eval()
 
             # ---- loop-level logging (IMPORTANT) ----
+            # NHỚ TRUYỀN THÊM halt_logits
             log_loop_steps(
                 inp=inp,
                 gt=gt,
                 intermediate_preds=intermediate_preds,
                 halting_weights=halting_weights,
+                halt_logits=halt_logits, 
                 global_step=global_step,
                 max_samples=2
             )
 
             # ---- final prediction logging ----
-            B = inp.size(0)
+            B_current = min(inp.size(0), 4) # Log thử 4 ảnh final thôi cho nhẹ
             imgs = []
             metrics_sum = {"psnr": 0, "ssim": 0, "rmse": 0}
 
-            for i in range(B):
-                vis, m = make_vis(inp[i], pred[i], gt[i])
+            for i in range(B_current):
+                # Cắt slicing [i:i+1] để giữ form 4D
+                vis, m = make_vis(inp[i:i+1], pred[i:i+1], gt[i:i+1])
 
                 imgs.append(
                     wandb.Image(
@@ -210,7 +201,7 @@ def train_one_epoch(
                     metrics_sum[k] += m[k]
 
             for k in metrics_sum:
-                metrics_sum[k] /= B
+                metrics_sum[k] /= B_current
 
             wandb.log({
                 "train/images_final": imgs,
