@@ -98,11 +98,17 @@ def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, gl
 # =========================================================
 
 def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, cfg, aug=None, stage=1, global_step=0):
+
     model.train()
     running_loss = 0.0
-    pbar = tqdm(loader, desc=f"Train Epoch {epoch} | Stage {stage}")
+
+    pbar = tqdm(
+        loader,
+        desc=f"Train Epoch {epoch} | Stage {stage}"
+    )
 
     for batch_idx, batch in enumerate(pbar):
+
         inp = batch["inp"].to(device, non_blocking=True)
         gt = batch["gt"].to(device, non_blocking=True)
 
@@ -111,48 +117,94 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(device_type="cuda", enabled=cfg.use_amp):
-            # Model trả về 5 giá trị khi return_all=True
+        with autocast(
+            device_type="cuda",
+            enabled=cfg.use_amp
+        ):
+
             outputs = model(inp, return_all=True)
+
             pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
 
             if stage == 1:
                 loss, loss_dict = criterion(
-                    target=gt, 
+                    target=gt,
                     final_pred=pred,
-                    intermediate_preds=intermediate_preds, 
+                    intermediate_preds=intermediate_preds,
                     halting_weights=halting_weights
                 )
             else:
                 loss, loss_dict = criterion(
-                    target=gt, 
+                    target=gt,
                     final_pred=pred,
-                    intermediate_preds=intermediate_preds, 
+                    intermediate_preds=intermediate_preds,
                     halting_weights=halting_weights,
                     halt_logits=gate_logits
                 )
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            cfg.grad_clip
+        )
+
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += loss.item()
 
-        # Log nhanh
-        if (batch_idx + 1) % 20 == 0 or batch_idx == len(loader) - 1:
-            expected_steps = (torch.arange(1, len(intermediate_preds)+1, device=halting_weights.device).float().view(-1, 1) * halting_weights).sum(dim=0).mean().item()
+        halt_stack = torch.stack([
+            h.mean(dim=tuple(range(1, h.dim())))
+            for h in halting_weights
+        ], dim=0)  # [T, B]
+
+        step_ids = torch.arange(
+            1,
+            len(intermediate_preds) + 1,
+            device=halt_stack.device
+        ).float().view(-1, 1)
+
+        expected_steps = (
+            step_ids * halt_stack
+        ).sum(dim=0).mean().item()
+
+        # Hard argmax step
+        hard_steps = (
+            halt_stack.argmax(dim=0).float().mean().item() + 1
+        )
+
+        # =====================================================
+        # Logging
+        # =====================================================
+
+        if (batch_idx + 1) % 20 == 0 or \
+           batch_idx == len(loader) - 1:
 
             wandb.log({
                 "train/loss": loss.item(),
                 "train/expected_steps": expected_steps,
+                "train/hard_steps": hard_steps,
                 "lr": optimizer.param_groups[0]["lr"],
-                **{f"train/{k}": v for k, v in loss_dict.items()}
+
+                **{
+                    f"train/{k}": (
+                        v.item()
+                        if torch.is_tensor(v)
+                        else v
+                    )
+                    for k, v in loss_dict.items()
+                }
+
             }, step=global_step)
 
         global_step += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}", steps=f"{expected_steps:.2f}")
+
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            steps=f"{expected_steps:.2f}"
+        )
 
     return running_loss / len(loader), global_step
 
