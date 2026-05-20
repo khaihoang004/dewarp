@@ -3,9 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_msssim import ms_ssim
 
-# ==========================================
-# 1. Base Loss
-# ==========================================
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
         super().__init__()
@@ -14,9 +11,6 @@ class CharbonnierLoss(nn.Module):
     def forward(self, pred, target):
         return torch.mean(torch.sqrt((pred - target) ** 2 + self.eps ** 2))
 
-# ==========================================
-# 2. Bộ tách tần số (Frequency Separator)
-# ==========================================
 class FrequencySeparator(nn.Module):
     def __init__(self, kernel_size=5):
         super().__init__()
@@ -28,16 +22,12 @@ class FrequencySeparator(nn.Module):
         high_freq = x - low_freq
         return low_freq, high_freq
 
-# ==========================================
-# 3. Stage1Loss: Hoàn chỉnh & An toàn
-# ==========================================
 class Stage1Loss(nn.Module):
     def __init__(self, prior_weight=0.005, freq_kernel=5, high_weight=2.0, w_freq=1.0, w_msssim=0.0):
         super().__init__()
         self.prior_weight = prior_weight
         self.high_weight = high_weight 
         
-        # Dùng w_freq và w_msssim thay cho alpha
         self.w_freq = w_freq 
         self.w_msssim = w_msssim
         
@@ -45,24 +35,18 @@ class Stage1Loss(nn.Module):
         self.freq_separator = FrequencySeparator(kernel_size=freq_kernel)
 
     def reconstruction_loss(self, pred, target):
-        # 1. TÁCH TẦN SỐ VÀ TÍNH CHARBONNIER
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
 
         loss_low = self.charbonnier(pred_low, target_low)
         loss_high = self.charbonnier(pred_high, target_high)
         
-        # Frequency Loss tổng
         freq_loss = loss_low + (self.high_weight * loss_high)
 
-        # 2. TÍNH MS-SSIM (Bảo vệ an toàn với Clamp)
         pred_safe = torch.clamp(pred, 0.0, 1.0).float()
         target_safe = target.float()
-        ms_ssim_loss = 1.0 - ms_ssim(
-            pred_safe, target_safe, data_range=1.0, size_average=True
-        )
+        ms_ssim_loss = 1.0 - ms_ssim(pred_safe, target_safe, data_range=1.0, size_average=True)
 
-        # 3. MIX THEO TRỌNG SỐ ĐỘC LẬP
         combined_loss = (self.w_freq * freq_loss) + (self.w_msssim * ms_ssim_loss)
         
         return combined_loss, loss_low, loss_high, ms_ssim_loss
@@ -85,32 +69,16 @@ class Stage1Loss(nn.Module):
             total_msssim_loss += (msssim_t / T)
 
         prior = torch.full_like(halting_weights, 1.0 / T)
-        
-        kl_loss = F.kl_div(
-            torch.log(halting_weights + 1e-6),
-            prior,
-            reduction='batchmean'
-        )
+        kl_loss = F.kl_div(torch.log(halting_weights + 1e-6), prior, reduction='batchmean')
 
         total_loss = total_rec_loss + (self.prior_weight * kl_loss)
         
-        # =====================================
-        # DICTIONARY LOGGING CHI TIẾT (Cho W&B)
-        # =====================================
         loss_dict = {
             "train/0_total_loss": total_loss.item(),
-            
-            # Chi tiết nhóm Tần Số (Charbonnier)
             "train/1_loss_low_freq_shadow": total_low_loss.item(),
             "train/2_loss_high_freq_text": total_high_loss.item(),
-            
-            # Chi tiết nhóm Cấu Trúc (MS-SSIM)
             "train/3_loss_ms_ssim": total_msssim_loss.item(),
-            
-            # Nhóm điều khiển Gate (ACT)
             "train/4_loss_kl_gate": kl_loss.item(),
-            
-            # Phân tích đóng góp (Weighted Contributions)
             "debug/weight_contrib_freq": (self.w_freq * (total_low_loss + self.high_weight * total_high_loss)).item(),
             "debug/weight_contrib_msssim": (self.w_msssim * total_msssim_loss).item()
         }

@@ -61,136 +61,56 @@ class BottleneckLayer(nn.Module):
 
 # --- KIẾN TRÚC LOOPED BOTTLENECK CHÍNH ---
 class AdaptiveLoopedBottleneck(nn.Module):
-
     def __init__(self, dim, max_loops=6):
         super().__init__()
-
         self.max_loops = max_loops
-
         self.layer = BottleneckLayer(dim)
 
-    def forward(self, x, halt_threshold=0.8):
-
+    def forward(self, x, halt_threshold=0.8, return_all=False):
         B = x.shape[0]
 
-        # =================================================
-        # TRAINING
-        # =================================================
-
-        if self.training:
-
+        # FIX: Chạy vòng lặp full nếu có return_all
+        if self.training or return_all:
             state = x
-
-            layer_outputs = []
-
-            halt_logits = []
-
-            halt_probs = []
+            layer_outputs, halt_logits, halt_probs = [], [], []
 
             for _ in range(self.max_loops):
-
                 state, logits_t, p_t = self.layer(state)
-
                 layer_outputs.append(state)
-
                 halt_logits.append(logits_t)
-
                 halt_probs.append(p_t)
             
             halt_logits = torch.stack(halt_logits, dim=0)
 
-            # ---------------------------------------------
-            # ACT weights
-            # ---------------------------------------------
-
             halting_weights = []
-
-            survival_prob = torch.ones(
-                B,
-                device=x.device
-            )
-
+            survival_prob = torch.ones(B, device=x.device)
             for t in range(self.max_loops):
-
                 p_t = halt_probs[t]
-
                 if t < self.max_loops - 1:
-
                     w_t = survival_prob * p_t
-
-                    survival_prob = survival_prob * (
-                                    1.0 - p_t
-                                ).clamp(min=1e-6)
-
+                    survival_prob = survival_prob * (1.0 - p_t).clamp(min=1e-6)
                 else:
                     w_t = survival_prob
-
                 halting_weights.append(w_t)
 
-            halting_weights = torch.stack(
-                halting_weights,
-                dim=0
-            )
-
-            halting_weights = halting_weights / (
-                halting_weights.sum(
-                    dim=0,
-                    keepdim=True
-                ) + 1e-8
-            )
-
-            # ---------------------------------------------
-            # weighted state
-            # ---------------------------------------------
+            halting_weights = torch.stack(halting_weights, dim=0)
+            halting_weights = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
 
             final_state = torch.zeros_like(layer_outputs[0])
-
             for t in range(self.max_loops):
+                w_t = halting_weights[t].view(B, 1, 1, 1)
+                final_state += (w_t * layer_outputs[t])
 
-                w_t = halting_weights[t].view(
-                    B,
-                    1,
-                    1,
-                    1
-                )
-
-                final_state += (
-                    w_t * layer_outputs[t]
-                )
-
-            return (
-                final_state,
-                layer_outputs,
-                halting_weights,
-                halt_logits
-            )
-
-        # =================================================
-        # INFERENCE
-        # =================================================
+            return final_state, layer_outputs, halting_weights, halt_logits
 
         else:
-
             state = x
-
-            cumulative_halt = torch.zeros(
-                B,
-                device=x.device
-            )
-
+            cumulative_halt = torch.zeros(B, device=x.device)
             for t in range(self.max_loops):
-
                 state, logits_t, p_t = self.layer(state)
-
-                cumulative_halt = torch.clamp(
-                    cumulative_halt + p_t,
-                    max=1.0
-                )
-
+                cumulative_halt = torch.clamp(cumulative_halt + p_t, max=1.0)
                 if (cumulative_halt >= halt_threshold).all():
-
                     return state
-
             return state
 
 
@@ -277,63 +197,34 @@ class LoopRepDocEnhanceNet(nn.Module):
         return output
 
     def forward(self, x, return_all=False):
-        x_ori = x # Giữ lại ảnh gốc đầu vào
+        x_ori = x 
         
-        # --- ENCODER PATH ---
         s0 = self.shallow_extractor(x)
         skip1, e1 = self.enc1(s0)
         skip2, e2 = self.enc2(e1)
         skip3, e3 = self.enc3(e2)
         
-        # --- ADAPTIVE BOTTLENECK ---
-        if self.training:
-            (
-                b_out,
-                layer_outputs,
-                halting_weights,
-                halt_logits
-            ) = self.bottleneck(e3)
-
+        if self.training or return_all:
+            (b_out, layer_outputs, halting_weights, halt_logits) = self.bottleneck(e3, return_all=return_all)
         else:
             b_out = self.bottleneck(e3)
             
-        # --- DECODER PATH ---
-        output = self._decode(
-            b_out,
-            skip1,
-            skip2,
-            skip3,
-            x_ori
-        )
+        output = self._decode(b_out, skip1, skip2, skip3, x_ori)
+        
         if not self.training:
             output = torch.clamp(output, 0.0, 1.0)
-            return output
-
-        intermediate_preds = None
 
         if return_all:
             intermediate_preds = []
-
             for state in layer_outputs:
-                pred_t = self._decode(
-                    state,
-                    skip1,
-                    skip2,
-                    skip3,
-                    x_ori
-                )
-
+                pred_t = self._decode(state, skip1, skip2, skip3, x_ori)
                 if not self.training:
                     pred_t = torch.clamp(pred_t, 0.0, 1.0)
-
                 intermediate_preds.append(pred_t)
 
-        return (
-            output,
-            intermediate_preds,
-            halting_weights,
-            halt_logits
-        )
+            return output, intermediate_preds, halting_weights, halt_logits
+
+        return output
 
     @torch.no_grad()
     def fuse_entire_model(self):
