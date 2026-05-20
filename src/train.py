@@ -19,6 +19,11 @@ def compute_psnr(pred, target):
 
 @torch.no_grad()
 def compute_ssim(pred, target):
+    if pred.dim() == 3:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 3:
+        target = target.unsqueeze(0)
+        
     return ssim(pred, target, data_range=1.0, size_average=True).item()
 
 
