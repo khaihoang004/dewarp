@@ -32,6 +32,13 @@ class SwiGLU_FFN(nn.Module):
         # Công thức: Swish(w) * v
         return self.project_out(F.silu(w) * v)
 
+class LayerScale(nn.Module):
+    def __init__(self, dim, init_value=1e-6):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim) * init_value)
+
+    def forward(self, x):
+        return x * self.scale.view(1, -1, 1, 1)
 
 class BottleneckLayer(nn.Module):
     def __init__(self, dim):
@@ -41,25 +48,29 @@ class BottleneckLayer(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.ffn = SwiGLU_FFN(dim)
         
-        # Gate chạy song song với mỗi layer để tính Exit Probability
+        self.scale1 = LayerScale(dim, init_value=1e-6)  # sau Attention
+        self.scale2 = LayerScale(dim, init_value=1e-6)  # sau FFN
+
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, dim // 4, 1),
+            nn.Conv2d(dim, dim // 4, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(dim // 4, 1, 1)
+            nn.Conv2d(dim // 4, 1, kernel_size=1)
         )
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        attn_out = self.attn(self.norm1(x))
+        x = x + self.scale1(attn_out)
         
-        # Tính xác suất exit tại bước này: dạng tensor (B, 1, 1, 1) -> view về (B,)
-        gate_logits = self.gate(x).view(-1)
-        exit_prob = torch.sigmoid(gate_logits)
+        ffn_out = self.ffn(self.norm2(x))
+        x = x + self.scale2(ffn_out)
+        
+        gate_logits = self.gate(x)
+        exit_prob = torch.sigmoid(gate_logits).view(-1)
+
         return x, gate_logits, exit_prob
 
 
-# --- KIẾN TRÚC LOOPED BOTTLENECK CHÍNH ---
 class AdaptiveLoopedBottleneck(nn.Module):
     def __init__(self, dim, max_loops=6):
         super().__init__()
@@ -68,49 +79,55 @@ class AdaptiveLoopedBottleneck(nn.Module):
 
     def forward(self, x, halt_threshold=0.8, return_all=False):
         B = x.shape[0]
+        device = x.device
 
-        # FIX: Chạy vòng lặp full nếu có return_all
         if self.training or return_all:
+            states = []
+            exit_probs = []          # list of (B,)
+            gate_logits_list = []
+
             state = x
-            layer_outputs, halt_logits, halt_probs = [], [], []
 
             for _ in range(self.max_loops):
-                state, logits_t, p_t = self.layer(state)
-                layer_outputs.append(state)
-                halt_logits.append(logits_t)
-                halt_probs.append(p_t)
+                state, g_logits, lambda_t = self.layer(state)
+                states.append(state)
+                exit_probs.append(lambda_t)
+                gate_logits_list.append(g_logits)
             
-            halt_logits = torch.stack(halt_logits, dim=0)
+            exit_probs = torch.stack(exit_probs, dim=0)        # (T, B)
+            gate_logits = torch.stack(gate_logits_list, dim=0)
 
-            halting_weights = []
-            survival_prob = torch.ones(B, device=x.device)
+            survival = torch.ones(B, device=device)            # S_0 = 1
+            halting_weights = torch.zeros_like(exit_probs)
+
             for t in range(self.max_loops):
-                p_t = halt_probs[t]
                 if t < self.max_loops - 1:
-                    w_t = survival_prob * p_t
-                    survival_prob = survival_prob * (1.0 - p_t).clamp(min=1e-6)
+                    p_t = exit_probs[t] * survival
+                    halting_weights[t] = p_t
+                    survival = survival * (1.0 - exit_probs[t]).clamp(min=1e-6)
                 else:
-                    w_t = survival_prob
-                halting_weights.append(w_t)
+                    halting_weights[t] = survival
 
-            halting_weights = torch.stack(halting_weights, dim=0)
-            halting_weights = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
-
-            final_state = torch.zeros_like(layer_outputs[0])
+            final_state = torch.zeros_like(states[0])
             for t in range(self.max_loops):
-                w_t = halting_weights[t].view(B, 1, 1, 1)
-                final_state += (w_t * layer_outputs[t])
+                w = halting_weights[t].view(B, 1, 1, 1)
+                final_state += w * states[t]
 
-            return final_state, layer_outputs, halting_weights, halt_logits
+            return final_state, states, halting_weights, gate_logits, exit_probs
 
         else:
+            # Inference
             state = x
-            cumulative_halt = torch.zeros(B, device=x.device)
+            cumulative = torch.zeros(B, device=device)
+
             for t in range(self.max_loops):
-                state, logits_t, p_t = self.layer(state)
-                cumulative_halt = torch.clamp(cumulative_halt + p_t, max=1.0)
-                if (cumulative_halt >= halt_threshold).all():
+                state, _, lambda_t = self.layer(state)
+                survival = (1.0 - cumulative).clamp(min=1e-6)
+                cumulative = torch.clamp(cumulative + lambda_t * survival, min=0.0, max=1.0)
+                
+                if (cumulative >= halt_threshold).all():
                     return state
+
             return state
 
 
@@ -172,7 +189,11 @@ class LoopRepDocEnhanceNet(nn.Module):
         self.dec1 = DecoderStage(base_dim, base_dim, base_dim, deploy=deploy)             # 1/2 -> 1/1
         
         # Output Head: Dự đoán phần dư toàn cục (Global Residual Mapping)
-        self.final_head = nn.Conv2d(base_dim, 3, kernel_size=3, padding=1)
+        self.final_head = nn.Sequential(
+            RepConv3(base_dim, base_dim, deploy=deploy),
+            nn.GELU(),
+            nn.Conv2d(base_dim, 3, kernel_size=3, padding=1)
+        )
 
 
     def _decode(
@@ -196,7 +217,7 @@ class LoopRepDocEnhanceNet(nn.Module):
 
         return output
 
-    def forward(self, x, return_all=False):
+    def forward(self, x, halt_threshold=0.80, return_all=False):
         x_ori = x 
         
         s0 = self.shallow_extractor(x)
@@ -205,10 +226,10 @@ class LoopRepDocEnhanceNet(nn.Module):
         skip3, e3 = self.enc3(e2)
         
         if self.training or return_all:
-            (b_out, layer_outputs, halting_weights, halt_logits) = self.bottleneck(e3, return_all=return_all)
+            b_out, layer_outputs, halting_weights, gate_logits, exit_probs = self.bottleneck(e3, halt_threshold=halt_threshold, return_all=return_all)
         else:
-            b_out = self.bottleneck(e3)
-            
+            b_out = self.bottleneck(e3, halt_threshold=halt_threshold)
+
         output = self._decode(b_out, skip1, skip2, skip3, x_ori)
         
         if not self.training:
@@ -222,7 +243,7 @@ class LoopRepDocEnhanceNet(nn.Module):
                     pred_t = torch.clamp(pred_t, 0.0, 1.0)
                 intermediate_preds.append(pred_t)
 
-            return output, intermediate_preds, halting_weights, halt_logits
+            return output, intermediate_preds, halting_weights, gate_logits, exit_probs
 
         return output
 
