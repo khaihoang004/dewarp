@@ -155,7 +155,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
 # =========================================================
 
 @torch.no_grad()
-def validate(model, loader, device, epoch=0):
+def validate(model, loader, device, global_step=0):
     model.eval()
     psnr_sum, ssim_sum = 0, 0
 
@@ -168,9 +168,13 @@ def validate(model, loader, device, epoch=0):
             if len(outputs) == 4:
                 pred, inter_preds, halt_w, halt_logits = outputs
                 log_loop_steps(
-                    inp=inp, gt=gt, intermediate_preds=inter_preds, 
-                    halting_weights=halt_w, halt_logits=halt_logits, 
-                    global_step=epoch, max_samples=2
+                    inp=inp, 
+                    gt=gt, 
+                    intermediate_preds=inter_preds, 
+                    halting_weights=halt_w, 
+                    halt_logits=halt_logits, 
+                    global_step=global_step,
+                    max_samples=2
                 )
             else:
                 pred = outputs[0] if isinstance(outputs, tuple) else outputs
@@ -198,7 +202,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
             device, epoch, cfg, aug=aug, stage=stage, global_step=global_step
         )
 
-        val_psnr, val_ssim = validate(model, val_loader, device, epoch=epoch)
+        val_psnr, val_ssim = validate(model, val_loader, device, global_step=global_step)
         scheduler.step()
 
         wandb.log({
