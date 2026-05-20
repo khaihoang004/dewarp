@@ -15,7 +15,7 @@ class CharbonnierLoss(nn.Module):
         return torch.mean(torch.sqrt((pred - target) ** 2 + self.eps ** 2))
 
 # ==========================================
-# 2. Bộ tách tần số (SOTA Document)
+# 2. Bộ tách tần số (Frequency Separator)
 # ==========================================
 class FrequencySeparator(nn.Module):
     def __init__(self, kernel_size=5):
@@ -24,26 +24,22 @@ class FrequencySeparator(nn.Module):
         self.padding = kernel_size // 2
 
     def forward(self, x):
-        # Tần số thấp: Màu nền giấy, bóng râm
         low_freq = F.avg_pool2d(x, kernel_size=self.kernel_size, stride=1, padding=self.padding)
-        # Tần số cao: Nét chữ, nhiễu
         high_freq = x - low_freq
         return low_freq, high_freq
 
 # ==========================================
-# 3. Stage1Loss: Đa Tần Số + MS-SSIM (Có thể tinh chỉnh trọng số)
+# 3. Stage1Loss: Hoàn chỉnh & An toàn
 # ==========================================
 class Stage1Loss(nn.Module):
-    def __init__(self, prior_weight=0.005, freq_kernel=5, high_weight=2.0, alpha=0.84):
+    def __init__(self, prior_weight=0.005, freq_kernel=5, high_weight=2.0, w_freq=1.0, w_msssim=0.0):
         super().__init__()
         self.prior_weight = prior_weight
-        
-        # Trọng số ép mạng bảo vệ dải cao tần (nét chữ)
         self.high_weight = high_weight 
         
-        # Alpha dùng để mix giữa Multi-Frequency Loss và MS-SSIM. 
-        # (Truyền 1.0 để tắt MS-SSIM, 0.84 để dùng cả hai)
-        self.alpha = alpha 
+        # Dùng w_freq và w_msssim thay cho alpha
+        self.w_freq = w_freq 
+        self.w_msssim = w_msssim
         
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FrequencySeparator(kernel_size=freq_kernel)
@@ -66,12 +62,12 @@ class Stage1Loss(nn.Module):
             pred_safe, target_safe, data_range=1.0, size_average=True
         )
 
-        # 3. MIX THEO THAM SỐ TỪ BÊN NGOÀI
-        combined_loss = (self.alpha * freq_loss) + ((1.0 - self.alpha) * ms_ssim_loss)
+        # 3. MIX THEO TRỌNG SỐ ĐỘC LẬP
+        combined_loss = (self.w_freq * freq_loss) + (self.w_msssim * ms_ssim_loss)
         
         return combined_loss, loss_low, loss_high, ms_ssim_loss
 
-def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwargs):
+    def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwargs):
         T = len(intermediate_preds)
         
         total_rec_loss = 0.0
@@ -104,18 +100,17 @@ def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwa
         loss_dict = {
             "train/0_total_loss": total_loss.item(),
             
-            # 2. Chi tiết nhóm Tần Số (Charbonnier)
-            "train/1_loss_low_freq_shadow": total_low_loss.item(),   # Xem tiến độ khử bóng/nền
-            "train/2_loss_high_freq_text": total_high_loss.item(),   # Xem tiến độ bảo vệ nét chữ
+            # Chi tiết nhóm Tần Số (Charbonnier)
+            "train/1_loss_low_freq_shadow": total_low_loss.item(),
+            "train/2_loss_high_freq_text": total_high_loss.item(),
             
-            # 3. Chi tiết nhóm Cấu Trúc (MS-SSIM)
-            "train/3_loss_ms_ssim": total_msssim_loss.item(),        # Sẽ bằng 0 nếu w_msssim = 0
+            # Chi tiết nhóm Cấu Trúc (MS-SSIM)
+            "train/3_loss_ms_ssim": total_msssim_loss.item(),
             
-            # 4. Nhóm điều khiển Gate (ACT)
-            "train/4_loss_kl_gate": kl_loss.item(),                  # Kiểm tra xem có bị lỗi log(0) không
+            # Nhóm điều khiển Gate (ACT)
+            "train/4_loss_kl_gate": kl_loss.item(),
             
-            # 5. Phân tích đóng góp (Weighted Contributions)
-            # Giúp bạn biết cái nào đang chiếm "trọng lượng" lớn nhất trong total_loss
+            # Phân tích đóng góp (Weighted Contributions)
             "debug/weight_contrib_freq": (self.w_freq * (total_low_loss + self.high_weight * total_high_loss)).item(),
             "debug/weight_contrib_msssim": (self.w_msssim * total_msssim_loss).item()
         }
