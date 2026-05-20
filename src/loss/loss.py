@@ -79,7 +79,7 @@ class Stage1Loss(nn.Module):
         # KL regularization → uniform halting
         halting_mean = halting_weights.mean(dim=1)                    # (T, B) -> (T,)
         prior = torch.full_like(halting_mean, 1.0 / T)
-        kl_loss = F.kl_div(torch.log(halting_mean + 1e-8), prior, reduction='mean')
+        kl_loss = F.kl_div(torch.log(halting_mean + 1e-8), prior, reduction='batchmean')
 
         total_loss = avg_rec + self.prior_weight * kl_loss
 
@@ -146,7 +146,7 @@ class Stage2Loss(nn.Module):
                 target_prob = (1.0 - utility).detach()
 
             gate_loss += F.binary_cross_entropy_with_logits(
-                halt_logits[t].view(-1), target_prob, reduction='mean'
+                halt_logits[t].view(-1), target_prob, reduction='batchmean'
             )
             prev_loss = curr_loss
 
