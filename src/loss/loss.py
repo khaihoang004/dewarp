@@ -19,65 +19,116 @@ class FrequencySeparator(nn.Module):
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
 
+    def gaussian_blur(self, x):
+        return F.avg_pool2d(x, kernel_size=self.kernel_size, stride=1, padding=self.padding)
+
     def forward(self, x):
-        low_freq = F.avg_pool2d(x, kernel_size=self.kernel_size, stride=1, padding=self.padding)
+        low_freq = self.gaussian_blur(x)
         high_freq = x - low_freq
         return low_freq, high_freq
 
 
-class Stage1Loss(nn.Module):
-    """Stage 1: Học refinement + phân bố halting đều"""
-    def __init__(self, prior_weight=0.01, freq_kernel=5, high_weight=1.5, 
-                 w_freq=1.0, w_msssim=0.8):
+class FocalFrequencyLoss(nn.Module):
+    def __init__(self, alpha=1.2):
         super().__init__()
-        self.prior_weight = prior_weight
+        self.alpha = alpha
+
+    def forward(self, pred, target):
+        pred = torch.clamp(pred, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+
+        pred_fft = torch.fft.fft2(pred, norm='ortho')
+        targ_fft = torch.fft.fft2(target, norm='ortho')
+
+        pred_amp = torch.abs(pred_fft)
+        targ_amp = torch.abs(targ_fft)
+
+        freq_dist = (pred_amp - targ_amp) ** 2
+        weight = (freq_dist / (freq_dist.mean(dim=[2, 3], keepdim=True) + 1e-8)) ** self.alpha
+        loss = (weight * freq_dist).mean()
+        return loss
+
+
+class Stage1Loss(nn.Module):
+    def __init__(self,
+                 high_weight=1.9,      # Giảm nhẹ so với 2.0 gốc vì high_freq đã khá tốt
+                 lambda_ffl=0.06,      # FFL nhỏ để hỗ trợ, tránh làm low_freq bị lấn át
+                 w_charb=0.75,         # Tăng mạnh để giảm low_freq loss
+                 w_freq=0.75,          # Giảm để nhường chỗ cho Charbonnier + MS-SSIM
+                 w_msssim=1.05,        # Tăng mạnh (gốc là 0) để cải thiện perceptual & val MS-SSIM
+                 prior_weight=0.006):  # Giảm nhẹ để reconstruction chiếm ưu thế
+        super().__init__()
+
         self.high_weight = high_weight
+        self.lambda_ffl = lambda_ffl
+        self.w_charb = w_charb
         self.w_freq = w_freq
         self.w_msssim = w_msssim
-        
+        self.prior_weight = prior_weight
+
         self.charbonnier = CharbonnierLoss()
-        self.freq_separator = FrequencySeparator(kernel_size=freq_kernel)
+        self.freq_separator = FrequencySeparator(kernel_size=5)
+        self.ffl = FocalFrequencyLoss(alpha=1.2)
 
     def reconstruction_loss(self, pred, target):
-        pred_low, pred_high = self.freq_separator(pred)
-        target_low, target_high = self.freq_separator(target)
+        pred = torch.clamp(pred, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
 
-        loss_low = self.charbonnier(pred_low, target_low)
-        loss_high = self.charbonnier(pred_high, target_high)
-        
+        # Global pixel accuracy
+        charb_loss = self.charbonnier(pred, target)
+
+        # Frequency separation
+        pred_low, pred_high = self.freq_separator(pred)
+        targ_low, targ_high = self.freq_separator(target)
+        loss_low = self.charbonnier(pred_low, targ_low)
+        loss_high = self.charbonnier(pred_high, targ_high)
         freq_loss = loss_low + self.high_weight * loss_high
 
-        # MS-SSIM
-        pred_safe = torch.clamp(pred, 0.0, 1.0)
-        ms_ssim_loss = 1.0 - ms_ssim(pred_safe, target, data_range=1.0, size_average=True)
+        # Focal Frequency Loss
+        ffl_loss = self.ffl(pred, target)
 
-        combined = self.w_freq * freq_loss + self.w_msssim * ms_ssim_loss
-        return combined, loss_low, loss_high, ms_ssim_loss
+        # Perceptual
+        ms_ssim_loss = 1.0 - ms_ssim(pred, target, data_range=1.0, size_average=True)
+
+        # Combined loss
+        combined = (self.w_charb * charb_loss +
+                    self.w_freq * freq_loss +
+                    self.lambda_ffl * ffl_loss +
+                    self.w_msssim * ms_ssim_loss)
+
+        return combined, charb_loss, loss_low, loss_high, ms_ssim_loss, ffl_loss
 
     def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwargs):
         T = len(intermediate_preds)
         B = target.shape[0]
 
         total_rec = 0.0
+        total_charb = 0.0
         total_low = 0.0
         total_high = 0.0
         total_msssim = 0.0
+        total_ffl = 0.0
 
         for t in range(T):
-            rec_t, low_t, high_t, msssim_t = self.reconstruction_loss(intermediate_preds[t], target)
+            rec_t, charb_t, low_t, high_t, msssim_t, ffl_t = self.reconstruction_loss(
+                intermediate_preds[t], target
+            )
             total_rec += rec_t
+            total_charb += charb_t
             total_low += low_t
             total_high += high_t
             total_msssim += msssim_t
+            total_ffl += ffl_t
 
-        # Average over time steps
         avg_rec = total_rec / T
+        avg_charb = total_charb / T
         avg_low = total_low / T
         avg_high = total_high / T
         avg_msssim = total_msssim / T
+        avg_ffl = total_ffl / T
 
-        # KL regularization → uniform halting
-        halting_mean = halting_weights.mean(dim=1)                    # (T, B) -> (T,)
+        # KL regularization
+        halting_mean = halting_weights.mean(dim=1)
         prior = torch.full_like(halting_mean, 1.0 / T)
         kl_loss = F.kl_div(torch.log(halting_mean + 1e-8), prior, reduction='batchmean')
 
@@ -86,84 +137,12 @@ class Stage1Loss(nn.Module):
         loss_dict = {
             "loss/total": total_loss.item(),
             "loss/rec": avg_rec.item(),
+            "loss/charb": avg_charb.item(),
             "loss/low_freq": avg_low.item(),
             "loss/high_freq": avg_high.item(),
+            "loss/ffl": avg_ffl.item(),
             "loss/ms_ssim": avg_msssim.item(),
             "loss/kl_gate": kl_loss.item(),
-        }
-
-        return total_loss, loss_dict
-
-
-class Stage2Loss(nn.Module):
-    """Stage 2: Chỉ tune Gate + Ponder"""
-    def __init__(self, gain_threshold=0.003, gain_scale=12.0, 
-                 ponder_weight=0.015, alpha=0.7):
-        super().__init__()
-        self.gain_threshold = gain_threshold
-        self.gain_scale = gain_scale
-        self.ponder_weight = ponder_weight
-        self.alpha = alpha
-        self.charbonnier = CharbonnierLoss()
-
-    def reconstruction_loss(self, pred, target):
-        charb = self.charbonnier(pred, target)
-        pred_clamp = torch.clamp(pred, 0.0, 1.0)
-        msssim = 1.0 - ms_ssim(pred_clamp, target, data_range=1.0, size_average=True)
-        combined = self.alpha * charb + (1.0 - self.alpha) * msssim
-        return combined, charb, msssim
-
-    def forward(self, target, final_pred, intermediate_preds, halting_weights, halt_logits, **kwargs):
-        T = len(intermediate_preds)
-        B = target.shape[0]
-
-        # Reconstruction losses (no_grad vì backbone freeze)
-        step_losses = []
-        avg_charb = 0.0
-        avg_msssim = 0.0
-
-        with torch.no_grad():
-            for pred_t in intermediate_preds:
-                rec_t, charb_t, msssim_t = self.reconstruction_loss(pred_t, target)
-                step_losses.append(rec_t)
-                avg_charb += charb_t
-                avg_msssim += msssim_t
-
-        avg_charb /= T
-        avg_msssim /= T
-
-        # Gate supervision based on improvement
-        gate_loss = 0.0
-        prev_loss = None
-
-        for t in range(T):
-            curr_loss = step_losses[t]
-            if prev_loss is None or t == 0:
-                target_prob = torch.zeros(B, device=curr_loss.device)
-            else:
-                gain = prev_loss - curr_loss
-                utility = torch.sigmoid(self.gain_scale * (gain - self.gain_threshold))
-                target_prob = (1.0 - utility).detach()
-
-            gate_loss += F.binary_cross_entropy_with_logits(
-                halt_logits[t].view(-1), target_prob, reduction='batchmean'
-            )
-            prev_loss = curr_loss
-
-        gate_loss /= T
-
-        # Ponder loss (encourage reasonable number of steps)
-        expected_steps = torch.sum((torch.arange(1, T+1, device=halting_weights.device).float().view(-1, 1) * halting_weights), dim=0).mean()
-
-        total_loss = gate_loss + self.ponder_weight * expected_steps
-
-        loss_dict = {
-            "loss/total": total_loss.item(),
-            "loss/gate": gate_loss.item(),
-            "loss/ponder": (self.ponder_weight * expected_steps).item(),
-            "loss/expected_steps": expected_steps.item(),
-            "eval/charbonnier": avg_charb.item(),
-            "eval/ms_ssim": avg_msssim.item(),
         }
 
         return total_loss, loss_dict
