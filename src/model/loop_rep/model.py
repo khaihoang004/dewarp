@@ -33,7 +33,7 @@ class SwiGLU_FFN(nn.Module):
         return self.project_out(F.silu(w) * v)
 
 class LayerScale(nn.Module):
-    def __init__(self, dim, init_value=1e-6):
+    def __init__(self, dim, init_value=0.1):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim) * init_value)
 
