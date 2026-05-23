@@ -27,48 +27,156 @@ class FrequencySeparator(nn.Module):
         high_freq = x - low_freq
         return low_freq, high_freq
 
+# FOCAL FREQUENCY LOSS
 
 class FocalFrequencyLoss(nn.Module):
-    def __init__(self, alpha=1.2):
+
+    def __init__(
+        self,
+        alpha=1.0,
+        patch_factor=2,
+        ave_spectrum=False,
+        log_matrix=True,
+        batch_matrix=False,
+    ):
         super().__init__()
+
         self.alpha = alpha
+        self.patch_factor = patch_factor
+        self.ave_spectrum = ave_spectrum
+        self.log_matrix = log_matrix
+        self.batch_matrix = batch_matrix
+
+    def tensor2freq(self, x):
+
+        patch_factor = self.patch_factor
+
+        _, _, h, w = x.shape
+
+        assert h % patch_factor == 0
+        assert w % patch_factor == 0
+
+        patch_h = h // patch_factor
+        patch_w = w // patch_factor
+
+        patch_list = []
+
+        for i in range(patch_factor):
+            for j in range(patch_factor):
+
+                patch = x[
+                    :,
+                    :,
+                    i * patch_h:(i + 1) * patch_h,
+                    j * patch_w:(j + 1) * patch_w
+                ]
+
+                patch_list.append(patch)
+
+        y = torch.stack(patch_list, dim=1)
+
+        freq = torch.fft.fft2(y, norm='ortho')
+
+        return freq
+
+    def loss_formulation(self, recon_freq, real_freq):
+
+        diff = recon_freq - real_freq
+
+        # complex distance
+        freq_distance = (
+            diff.real.pow(2) +
+            diff.imag.pow(2)
+        )
+
+        # dynamic spectrum weight matrix
+        matrix_tmp = freq_distance.detach()
+
+        if self.log_matrix:
+            matrix_tmp = torch.log(matrix_tmp + 1.0)
+
+        if self.batch_matrix:
+
+            matrix_tmp = matrix_tmp / (
+                matrix_tmp.max() + 1e-8
+            )
+
+        else:
+
+            matrix_tmp = matrix_tmp / (
+                matrix_tmp.amax(
+                    dim=(-2, -1),
+                    keepdim=True
+                ) + 1e-8
+            )
+
+        matrix_tmp = matrix_tmp.clamp(0.0, 1.0)
+
+        weight_matrix = matrix_tmp.pow(self.alpha)
+
+        loss = weight_matrix * freq_distance
+
+        return loss.mean()
 
     def forward(self, pred, target):
         pred = torch.clamp(pred, 0.0, 1.0)
         target = torch.clamp(target, 0.0, 1.0)
 
-        pred_fft = torch.fft.fft2(pred, norm='ortho')
-        targ_fft = torch.fft.fft2(target, norm='ortho')
+        pred_freq = self.tensor2freq(pred)
+        target_freq = self.tensor2freq(target)
 
-        pred_amp = torch.abs(pred_fft)
-        targ_amp = torch.abs(targ_fft)
+        if self.ave_spectrum:
 
-        freq_dist = (pred_amp - targ_amp) ** 2
-        weight = (freq_dist / (freq_dist.mean(dim=[2, 3], keepdim=True) + 1e-8)) ** self.alpha
-        loss = (weight * freq_dist).mean()
+            pred_freq = pred_freq.mean(0, keepdim=True)
+            target_freq = target_freq.mean(0, keepdim=True)
+
+        loss = self.loss_formulation(
+            pred_freq,
+            target_freq
+        )
+
         return loss
 
 
 class Stage1Loss(nn.Module):
     def __init__(self,
-                 high_weight=1.9,      # Giảm nhẹ so với 2.0 gốc vì high_freq đã khá tốt
-                 lambda_ffl=0.06,      # FFL nhỏ để hỗ trợ, tránh làm low_freq bị lấn át
-                 w_charb=0.75,         # Tăng mạnh để giảm low_freq loss
-                 w_freq=0.75,          # Giảm để nhường chỗ cho Charbonnier + MS-SSIM
-                 w_msssim=1.05,        # Tăng mạnh (gốc là 0) để cải thiện perceptual & val MS-SSIM
-                 prior_weight=0.006):  # Giảm nhẹ để reconstruction chiếm ưu thế
+
+                 # high-frequency emphasis
+                 high_weight=1.6,
+
+                 # reconstruction balance
+                 w_charb=0.85,
+                 w_freq=0.45,
+
+                 # FFL
+                 lambda_ffl=0.004,
+
+                 # perceptual
+                 w_msssim=0.22,
+
+                 # ACT prior
+                 prior_weight=0.006):
+
         super().__init__()
 
         self.high_weight = high_weight
-        self.lambda_ffl = lambda_ffl
+
         self.w_charb = w_charb
         self.w_freq = w_freq
+        self.lambda_ffl = lambda_ffl
         self.w_msssim = w_msssim
         self.prior_weight = prior_weight
 
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FrequencySeparator(kernel_size=5)
-        self.ffl = FocalFrequencyLoss(alpha=1.2)
+
+        self.ffl = FocalFrequencyLoss(
+            alpha=1.0,
+            patch_factor=2,
+            ave_spectrum=False,
+            log_matrix=True,
+            batch_matrix=False,
+        )
 
     def reconstruction_loss(self, pred, target):
         pred = torch.clamp(pred, 0.0, 1.0)
@@ -90,13 +198,25 @@ class Stage1Loss(nn.Module):
         # Perceptual
         ms_ssim_loss = 1.0 - ms_ssim(pred, target, data_range=1.0, size_average=True)
 
-        # Combined loss
-        combined = (self.w_charb * charb_loss +
-                    self.w_freq * freq_loss +
-                    self.lambda_ffl * ffl_loss +
-                    self.w_msssim * ms_ssim_loss)
+        # =====================================================
+        # total reconstruction
+        # =====================================================
 
-        return combined, charb_loss, loss_low, loss_high, ms_ssim_loss, ffl_loss
+        total = (
+            self.w_charb * charb_loss +
+            self.w_freq * freq_loss +
+            self.lambda_ffl * ffl_loss +
+            self.w_msssim * ms_ssim_loss
+        )
+
+        return (
+            total,
+            charb_loss,
+            loss_low,
+            loss_high,
+            ms_ssim_loss,
+            ffl_loss
+        )
 
     def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwargs):
         T = len(intermediate_preds)
@@ -110,9 +230,20 @@ class Stage1Loss(nn.Module):
         total_ffl = 0.0
 
         for t in range(T):
-            rec_t, charb_t, low_t, high_t, msssim_t, ffl_t = self.reconstruction_loss(
-                intermediate_preds[t], target
+
+            (
+                rec_t,
+                charb_t,
+                low_t,
+                high_t,
+                msssim_t,
+                ffl_t
+
+            ) = self.reconstruction_loss(
+                intermediate_preds[t],
+                target
             )
+
             total_rec += rec_t
             total_charb += charb_t
             total_low += low_t
