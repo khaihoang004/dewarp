@@ -179,7 +179,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
         # Logging
         # =====================================================
 
-        if (batch_idx + 1) % 20 == 0 or \
+        if (batch_idx + 1) % 250 == 0 or \
            batch_idx == len(loader) - 1:
 
             wandb.log({
@@ -216,7 +216,12 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
 @torch.no_grad()
 def validate(model, loader, device, global_step=0, log_images=True):
     model.eval()
-    psnr_sum = ssim_sum = ms_ssim_sum = 0.0
+
+    psnr_sum = 0.0
+    ssim_sum = 0.0
+    ms_ssim_sum = 0.0
+    rmse_sum = 0.0
+
     total = 0
 
     for i, batch in enumerate(tqdm(loader, desc="Validating")):
@@ -235,12 +240,15 @@ def validate(model, loader, device, global_step=0, log_images=True):
         psnr_sum += compute_psnr(pred, gt)
         ssim_sum += compute_ssim(pred, gt)
         ms_ssim_sum += compute_ms_ssim(pred, gt)
+        rmse_sum += compute_rmse(pred, gt)
+
         total += 1
 
     return {
         "val/psnr": psnr_sum / total,
         "val/ssim": ssim_sum / total,
         "val/ms_ssim": ms_ssim_sum / total,
+        "val/rmse": rmse_sum / total,
     }
 
 
