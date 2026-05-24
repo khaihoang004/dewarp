@@ -179,8 +179,8 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
         # Logging
         # =====================================================
 
-        if (batch_idx + 1) % 250 == 0 or \
-           batch_idx == len(loader) - 1:
+        # if (batch_idx + 1) % 250 == 0 or batch_idx == len(loader) - 1:
+        if batch_idx == len(loader) - 1:
 
             wandb.log({
                 "train/loss": loss.item(),
