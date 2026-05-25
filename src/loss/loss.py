@@ -42,6 +42,7 @@ class Stage1Loss(nn.Module):
         w_spatial=1.0,
         w_freq=1.0,
         w_msssim=0.05,
+        msssim_warmup_epochs=5,
     ):
         super().__init__()
 
@@ -54,10 +55,22 @@ class Stage1Loss(nn.Module):
         self.w_freq = w_freq
         self.w_msssim = w_msssim
 
+        self.msssim_warmup_epochs = msssim_warmup_epochs
+
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FrequencySeparator(kernel_size=freq_kernel)
 
-    def reconstruction_loss(self, pred, target):
+    # MS-SSIM Warmup
+    def get_msssim_weight(self, current_epoch):
+
+        if self.msssim_warmup_epochs <= 0:
+            return self.w_msssim
+
+        progress = min(current_epoch / self.msssim_warmup_epochs, 1.0)
+
+        return progress * self.w_msssim
+
+    def reconstruction_loss(self, pred, target, current_epoch=0):
 
         # Direct spatial reconstruction
         spatial_loss = self.charbonnier(pred, target)
@@ -85,10 +98,14 @@ class Stage1Loss(nn.Module):
             size_average=True
         )
 
+        current_msssim_weight = self.get_msssim_weight(
+            current_epoch
+        )
+
         combined = (
             self.w_spatial * spatial_loss
             + self.w_freq * freq_loss
-            + self.w_msssim * ms_ssim_loss
+            + current_msssim_weight * ms_ssim_loss
         )
 
         return (
@@ -96,7 +113,8 @@ class Stage1Loss(nn.Module):
             spatial_loss,
             loss_low,
             loss_high,
-            ms_ssim_loss
+            ms_ssim_loss,
+            current_msssim_weight,
         )
 
     def forward(
@@ -105,6 +123,7 @@ class Stage1Loss(nn.Module):
         final_pred,
         intermediate_preds,
         halting_weights,
+        current_epoch=0,
         **kwargs
     ):
 
@@ -116,9 +135,10 @@ class Stage1Loss(nn.Module):
         total_low = 0.0
         total_high = 0.0
         total_msssim = 0.0
+        current_msssim_weight = 0.0
 
         for t in range(T):
-            rec_t, spatial_t, low_t, high_t, msssim_t = self.reconstruction_loss(intermediate_preds[t], target)
+            rec_t, spatial_t, low_t, high_t, msssim_t, current_msssim_weight = self.reconstruction_loss(intermediate_preds[t], target)
             total_rec += rec_t
 
             total_spatial += spatial_t
@@ -150,6 +170,7 @@ class Stage1Loss(nn.Module):
             "loss/low_freq": avg_low.item(),
             "loss/high_freq": avg_high.item(),
             "loss/ms_ssim": avg_msssim.item(),
+            "loss/ms_ssim_weight": current_msssim_weight,
             "loss/kl_gate": kl_loss.item(),
         }
 
