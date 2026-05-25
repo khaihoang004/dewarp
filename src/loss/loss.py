@@ -29,54 +29,111 @@ class FrequencySeparator(nn.Module):
 
 
 class Stage1Loss(nn.Module):
-    """Stage 1: Học refinement + phân bố halting đều"""
-    def __init__(self, prior_weight=0.01, freq_kernel=5, high_weight=1.5, 
-                 w_freq=1.0, w_msssim=0.8):
+    def __init__(
+        self,
+        prior_weight=0.01,
+        freq_kernel=5,
+
+        # frequency
+        low_weight=0.5,
+        high_weight=1.2,
+
+        # global weights
+        w_spatial=1.0,
+        w_freq=1.0,
+        w_msssim=0.05,
+    ):
         super().__init__()
+
         self.prior_weight = prior_weight
+
+        self.low_weight = low_weight
         self.high_weight = high_weight
+
+        self.w_spatial = w_spatial
         self.w_freq = w_freq
         self.w_msssim = w_msssim
-        
+
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FrequencySeparator(kernel_size=freq_kernel)
 
     def reconstruction_loss(self, pred, target):
+
+        # Direct spatial reconstruction
+        spatial_loss = self.charbonnier(pred, target)
+
+        # Frequency decomposition
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
 
         loss_low = self.charbonnier(pred_low, target_low)
         loss_high = self.charbonnier(pred_high, target_high)
-        
-        freq_loss = loss_low + self.high_weight * loss_high
+
+        freq_loss = (
+            self.low_weight * loss_low
+            + self.high_weight * loss_high
+        )
 
         # MS-SSIM
         pred_safe = torch.clamp(pred, 0.0, 1.0)
-        ms_ssim_loss = 1.0 - ms_ssim(pred_safe, target, data_range=1.0, size_average=True)
+        target_safe = torch.clamp(target, 0.0, 1.0)
 
-        combined = self.w_freq * freq_loss + self.w_msssim * ms_ssim_loss
-        return combined, loss_low, loss_high, ms_ssim_loss
+        ms_ssim_loss = 1.0 - ms_ssim(
+            pred_safe,
+            target_safe,
+            data_range=1.0,
+            size_average=True
+        )
 
-    def forward(self, target, final_pred, intermediate_preds, halting_weights, **kwargs):
+        combined = (
+            self.w_spatial * spatial_loss
+            + self.w_freq * freq_loss
+            + self.w_msssim * ms_ssim_loss
+        )
+
+        return (
+            combined,
+            spatial_loss,
+            loss_low,
+            loss_high,
+            ms_ssim_loss
+        )
+
+    def forward(
+        self,
+        target,
+        final_pred,
+        intermediate_preds,
+        halting_weights,
+        **kwargs
+    ):
+
         T = len(intermediate_preds)
-        B = target.shape[0]
 
         total_rec = 0.0
+
+        total_spatial = 0.0
         total_low = 0.0
         total_high = 0.0
         total_msssim = 0.0
 
         for t in range(T):
-            rec_t, low_t, high_t, msssim_t = self.reconstruction_loss(intermediate_preds[t], target)
+            rec_t, spatial_t, low_t, high_t, msssim_t = self.reconstruction_loss(intermediate_preds[t], target)
             total_rec += rec_t
+
+            total_spatial += spatial_t
             total_low += low_t
             total_high += high_t
+
             total_msssim += msssim_t
 
         # Average over time steps
         avg_rec = total_rec / T
+
+        avg_spatial = total_spatial / T
         avg_low = total_low / T
         avg_high = total_high / T
+
         avg_msssim = total_msssim / T
 
         # KL regularization → uniform halting
@@ -89,6 +146,7 @@ class Stage1Loss(nn.Module):
         loss_dict = {
             "loss/total": total_loss.item(),
             "loss/rec": avg_rec.item(),
+            "loss/spatial": avg_spatial.item(),
             "loss/low_freq": avg_low.item(),
             "loss/high_freq": avg_high.item(),
             "loss/ms_ssim": avg_msssim.item(),
