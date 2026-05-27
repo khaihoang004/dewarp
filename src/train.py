@@ -65,7 +65,7 @@ def make_vis(inp, pred, gt):
     return vis, metrics
 
 
-def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, global_step, max_samples=2):
+def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, global_step, max_samples=4):
     T = len(intermediate_preds)
     B = min(inp.size(0), max_samples)
     log_dict = {}
