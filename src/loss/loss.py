@@ -19,14 +19,40 @@ class CharbonnierLoss(nn.Module):
 class FrequencySeparator(nn.Module):
     def __init__(self, kernel_size=5):
         super().__init__()
+
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
 
-    def forward(self, x):
-        low_freq = F.avg_pool2d(x, kernel_size=self.kernel_size, stride=1, padding=self.padding)
-        high_freq = x - low_freq
-        return low_freq, high_freq
+    def forward(self, x, grayscale_high=True):
+        low_freq = F.avg_pool2d(
+            x,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=self.padding
+        )
 
+        if grayscale_high:
+
+            # luminance only
+            gray = (
+                0.299 * x[:, 0:1] +
+                0.587 * x[:, 1:2] +
+                0.114 * x[:, 2:3]
+            )
+
+            gray_low = F.avg_pool2d(
+                gray,
+                kernel_size=self.kernel_size,
+                stride=1,
+                padding=self.padding
+            )
+
+            high_freq = gray - gray_low
+
+        else:
+            high_freq = x - low_freq
+
+        return low_freq, high_freq
 
 class Stage1Loss(nn.Module):
     def __init__(
