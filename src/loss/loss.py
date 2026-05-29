@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from pytorch_ssim import ssim
+from pytorch_msssim import ssim
 
 
 class CharbonnierLoss(nn.Module):
