@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from pytorch_ssim import ssim
 
 
@@ -183,9 +184,9 @@ class Stage1Loss(nn.Module):
         avg_ssim = total_ssim / T
 
         # KL regularization → uniform halting
-        halting_mean = halting_weights.mean(dim=1)                    # (T, B) -> (T,)
-        prior = torch.full_like(halting_mean, 1.0 / T)
-        kl_loss = F.kl_div(torch.log(halting_mean + 1e-8), prior, reduction='sum')
+        hw_b = halting_weights.transpose(0, 1) # (T, B) -> (B, T)
+        # KL(Halting || Uniform)
+        kl_loss = torch.sum(hw_b * (torch.log(hw_b + 1e-8) - math.log(1.0 / T)), dim=1).mean()
 
         total_loss = avg_rec + self.prior_weight * kl_loss
 
