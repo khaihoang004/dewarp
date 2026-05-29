@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_msssim import ms_ssim
+from pytorch_ssim import ssim
 
 
 class CharbonnierLoss(nn.Module):
@@ -67,8 +67,8 @@ class Stage1Loss(nn.Module):
         # global weights
         w_spatial=1.0,
         w_freq=1.0,
-        w_msssim=0.05,
-        msssim_warmup_epochs=5,
+        w_ssim=0.05,
+        ssim_warmup_epochs=5,
     ):
         super().__init__()
 
@@ -79,22 +79,22 @@ class Stage1Loss(nn.Module):
 
         self.w_spatial = w_spatial
         self.w_freq = w_freq
-        self.w_msssim = w_msssim
+        self.w_ssim = w_ssim
 
-        self.msssim_warmup_epochs = msssim_warmup_epochs
+        self.ssim_warmup_epochs = ssim_warmup_epochs
 
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FrequencySeparator(kernel_size=freq_kernel)
 
-    # MS-SSIM Warmup
-    def get_msssim_weight(self, current_epoch):
+    # SSIM Warmup
+    def get_ssim_weight(self, current_epoch):
 
-        if self.msssim_warmup_epochs <= 0:
-            return self.w_msssim
+        if self.ssim_warmup_epochs <= 0:
+            return self.w_ssim
 
-        progress = min(current_epoch / self.msssim_warmup_epochs, 1.0)
+        progress = min(current_epoch / self.ssim_warmup_epochs, 1.0)
 
-        return progress * self.w_msssim
+        return progress * self.w_ssim
 
     def reconstruction_loss(self, pred, target, current_epoch=0):
 
@@ -113,25 +113,25 @@ class Stage1Loss(nn.Module):
             + self.high_weight * loss_high
         )
 
-        # MS-SSIM
+        # SSIM
         pred_safe = torch.clamp(pred, 0.0, 1.0)
         target_safe = torch.clamp(target, 0.0, 1.0)
 
-        ms_ssim_loss = 1.0 - ms_ssim(
+        ssim_loss = 1.0 - ssim(
             pred_safe,
             target_safe,
             data_range=1.0,
             size_average=True
         )
 
-        current_msssim_weight = self.get_msssim_weight(
+        current_ssim_weight = self.get_ssim_weight(
             current_epoch
         )
 
         combined = (
             self.w_spatial * spatial_loss
             + self.w_freq * freq_loss
-            + current_msssim_weight * ms_ssim_loss
+            + current_ssim_weight * ssim_loss
         )
 
         return (
@@ -139,8 +139,8 @@ class Stage1Loss(nn.Module):
             spatial_loss,
             loss_low,
             loss_high,
-            ms_ssim_loss,
-            current_msssim_weight,
+            ssim_loss,
+            current_ssim_weight,
         )
 
     def forward(
@@ -160,18 +160,18 @@ class Stage1Loss(nn.Module):
         total_spatial = 0.0
         total_low = 0.0
         total_high = 0.0
-        total_msssim = 0.0
-        current_msssim_weight = 0.0
+        total_ssim = 0.0
+        current_ssim_weight = 0.0
 
         for t in range(T):
-            rec_t, spatial_t, low_t, high_t, msssim_t, current_msssim_weight = self.reconstruction_loss(intermediate_preds[t], target)
+            rec_t, spatial_t, low_t, high_t, ssim_t, current_ssim_weight = self.reconstruction_loss(intermediate_preds[t], target)
             total_rec += rec_t
 
             total_spatial += spatial_t
             total_low += low_t
             total_high += high_t
 
-            total_msssim += msssim_t
+            total_ssim += ssim_t
 
         # Average over time steps
         avg_rec = total_rec / T
@@ -180,7 +180,7 @@ class Stage1Loss(nn.Module):
         avg_low = total_low / T
         avg_high = total_high / T
 
-        avg_msssim = total_msssim / T
+        avg_ssim = total_ssim / T
 
         # KL regularization → uniform halting
         halting_mean = halting_weights.mean(dim=1)                    # (T, B) -> (T,)
@@ -195,8 +195,8 @@ class Stage1Loss(nn.Module):
             "loss/spatial": avg_spatial.item(),
             "loss/low_freq": avg_low.item(),
             "loss/high_freq": avg_high.item(),
-            "loss/ms_ssim": avg_msssim.item(),
-            "loss/ms_ssim_weight": current_msssim_weight,
+            "loss/ssim": avg_ssim.item(),
+            "loss/ssim_weight": current_ssim_weight,
             "loss/kl_gate": kl_loss.item(),
         }
 
@@ -220,11 +220,11 @@ class Stage2Loss(nn.Module):
         pred_clamp = torch.clamp(pred, 0.0, 1.0)
         
         # size_average=False để trả về tensor (B,)
-        msssim_val = ms_ssim(pred_clamp, target, data_range=1.0, size_average=False)
-        msssim = 1.0 - msssim_val
+        ssim_val = ssim(pred_clamp, target, data_range=1.0, size_average=False)
+        ssim = 1.0 - ssim_val
         
-        combined = self.alpha * charb + (1.0 - self.alpha) * msssim
-        return combined, charb, msssim
+        combined = self.alpha * charb + (1.0 - self.alpha) * ssim
+        return combined, charb, ssim
 
     def forward(self, target, final_pred, intermediate_preds, halting_weights, halt_logits, **kwargs):
         T = len(intermediate_preds)
@@ -232,17 +232,17 @@ class Stage2Loss(nn.Module):
 
         step_losses = []
         avg_charb = 0.0
-        avg_msssim = 0.0
+        avg_ssim = 0.0
 
         with torch.no_grad():
             for pred_t in intermediate_preds:
-                rec_t, charb_t, msssim_t = self.reconstruction_loss(pred_t, target)
+                rec_t, charb_t, ssim_t = self.reconstruction_loss(pred_t, target)
                 step_losses.append(rec_t) # rec_t hiện có shape (B,)
                 avg_charb += charb_t.mean()
-                avg_msssim += msssim_t.mean()
+                avg_ssim += ssim_t.mean()
 
         avg_charb /= T
-        avg_msssim /= T
+        avg_ssim /= T
 
         gate_loss = 0.0
         prev_loss = None
@@ -275,7 +275,7 @@ class Stage2Loss(nn.Module):
             "loss/ponder": (self.ponder_weight * expected_steps).item(),
             "loss/expected_steps": expected_steps.item(),
             "eval/charbonnier": avg_charb.item(),
-            "eval/ms_ssim": avg_msssim.item(),
+            "eval/ssim": avg_ssim.item(),
         }
 
         return total_loss, loss_dict
