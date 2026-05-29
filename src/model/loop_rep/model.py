@@ -149,11 +149,12 @@ class EncoderStage(nn.Module):
 
         self.down = nn.PixelUnshuffle(downscale_factor=2)
         self.channel_compress = nn.Conv2d(out_channels * 4, out_channels, kernel_size=1, bias=False)
+        self.act_down = nn.GELU()
 
     def forward(self, x):
         feat = self.act(self.conv(x))
         downsampled = self.down(feat)
-        downsampled = self.channel_compress(downsampled)
+        downsampled = self.act_down(self.channel_compress(downsampled))
         return feat, downsampled
 
 
@@ -168,12 +169,14 @@ class DecoderStage(nn.Module):
             bias=False
         )
         self.up = nn.PixelShuffle(upscale_factor=2)
+        self.act_up = nn.GELU()
         self.conv = RepConv3(in_channels + skip_channels, out_channels, deploy=deploy)
         self.act = nn.GELU()
 
     def forward(self, x, skip_feat):
         x = self.expand_channels(x)
         x = self.up(x)
+        x = self.act_up(x)
         x = torch.cat([x, skip_feat], dim=1)
         return self.act(self.conv(x))
 
