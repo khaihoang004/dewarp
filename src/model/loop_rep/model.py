@@ -75,8 +75,8 @@ class BottleneckLayer(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.ffn = SwiGLU_FFN(dim)
         
-        self.scale1 = LayerScale(dim, init_value=1e-6)  # sau Attention
-        self.scale2 = LayerScale(dim, init_value=1e-6)  # sau FFN
+        self.scale1 = LayerScale(dim, init_value=0.1)  # sau Attention
+        self.scale2 = LayerScale(dim, init_value=0.1)  # sau FFN
 
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -197,15 +197,12 @@ class EncoderStage(nn.Module):
 class DecoderStage(nn.Module):
     def __init__(self, in_channels, skip_channels, out_channels, num_blocks=1, deploy=False):
         super().__init__()
-        self.expand_channels = nn.Conv2d(
-            in_channels, 
-            in_channels * 4, 
-            kernel_size=3, 
-            padding=1, 
-            bias=False
-        )
+        self.expand_channels = nn.Conv2d(in_channels, in_channels * 4, kernel_size=3, padding=1, bias=False)
         self.up = nn.PixelShuffle(upscale_factor=2)
         self.act_up = nn.GELU()
+
+        self.gate_conv = nn.Conv2d(in_channels, skip_channels, kernel_size=1, bias=True)
+
         self.conv = RepConv3(in_channels + skip_channels, out_channels, deploy=deploy)
         self.act = nn.GELU()
 
@@ -218,7 +215,11 @@ class DecoderStage(nn.Module):
         x = self.expand_channels(x)
         x = self.up(x)
         x = self.act_up(x)
-        x = torch.cat([x, skip_feat], dim=1)
+        
+        gate_mask = torch.sigmoid(self.gate_conv(x))
+        gated_skip = skip_feat * gate_mask
+
+        x = torch.cat([x, gated_skip], dim=1)
         x = self.act(self.conv(x))
         
         for layer in self.stacked_layers:
@@ -228,7 +229,7 @@ class DecoderStage(nn.Module):
 
 
 class LoopRepDocEnhanceNet(nn.Module):
-    def __init__(self, base_dim=32, max_loops=4, enc_blocks=[2, 2, 4], dec_blocks=[2, 2, 2], deploy=False):
+    def __init__(self, base_dim=32, max_loops=4, enc_blocks=[1, 1, 2], dec_blocks=[1, 1, 2], deploy=False):
         super().__init__()
         self.base_dim = base_dim
         
