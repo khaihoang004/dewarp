@@ -131,7 +131,8 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
                     target=gt,
                     final_pred=pred,
                     intermediate_preds=intermediate_preds,
-                    halting_weights=halting_weights
+                    halting_weights=halting_weights,
+                    current_epoch=epoch 
                 )
             else:
                 loss, loss_dict = criterion(
@@ -143,6 +144,14 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
                 )
 
         scaler.scale(loss).backward()
+        if batch_idx == 0:
+            # Lấy ngẫu nhiên một tầng conv trong bottleneck để kiểm tra grad
+            for name, param in model.named_parameters():
+                if "bottleneck" in name and param.grad is not None:
+                    grad_sum = param.grad.abs().sum().item()
+                    print(f"\n[DEBUG GRAD] {name} | Tổng Đạo Hàm = {grad_sum:.8f}")
+                    break
+
         scaler.unscale_(optimizer)
 
         torch.nn.utils.clip_grad_norm_(
