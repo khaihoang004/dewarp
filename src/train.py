@@ -7,7 +7,7 @@ from pytorch_msssim import ms_ssim, ssim
 
 
 # =========================================================
-# METRICS
+# METRICS (TÍNH TOÁN THEO TỪNG ẢNH ĐƠN LẺ)
 # =========================================================
 
 @torch.no_grad()
@@ -38,7 +38,7 @@ def compute_rmse(pred, target):
 
 
 # =========================================================
-# VISUAL + LOGGING
+# VISUAL + LOGGING WANDB
 # =========================================================
 
 def make_vis(inp, pred, gt):
@@ -84,7 +84,7 @@ def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, gl
 
             caption = (f"Loop {t+1}/{T} | Exit: {exit_prob*100:.1f}% | "
                       f"Weight: {act_w:.3f} | PSNR={metrics['psnr']:.2f} | "
-                      f"SSIM={metrics['ssim']:.4f} | MS-SSIM={metrics['ms_ssim']:.4f}")
+                      f"SSIM={metrics['ssim']:.4f} | MS-SIM={metrics['ms_ssim']:.4f}")
 
             loop_images.append(wandb.Image(vis, caption=caption))
 
@@ -94,40 +94,37 @@ def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, gl
 
 
 # =========================================================
-# 🛑 HỆ THỐNG DEBUG TOÁN HỌC ĐA ĐIỂM (DIAGNOSTIC ENGINE)
+# 🛑 HỆ THỐNG CHẨN ĐOÁN SỐ HỌC TERMINAL
 # =========================================================
 
 def inspect_loop_dynamics(intermediate_preds, halting_weights, halt_logits):
     """Kiểm tra sự tiến hóa số học giữa các vòng lặp để cô lập lỗi hiển thị."""
-    print("\n" + "="*30 + " TRÌNH CHẨN ĐOÁN LÕI LẶP DỘNG " + "="*30)
+    print("\n" + "="*30 + " TRÌNH CHẨN ĐOÁN LÕI LẶP ĐỘNG " + "="*30)
     T = len(intermediate_preds)
     print(f"[*] Tổng số vòng lặp nhận được từ Model: {T}")
     
     if T > 1:
-        # Đo sai lệch lớn nhất tuyệt đối giữa các bước lặp trước khi qua hàm Vis
         diff_1_2 = (intermediate_preds[1] - intermediate_preds[0]).abs().max().item()
         diff_last_first = (intermediate_preds[-1] - intermediate_preds[0]).abs().max().item()
         
         print(f"[*] Sai lệch toán học Max (|Loop 2 - Loop 1|): {diff_1_2:.8f}")
         print(f"[*] Sai lệch toán học Max (|Loop Cuối - Loop 1|): {diff_last_first:.8f}")
         
-        # Kiểm tra hiện tượng bão hòa giá trị pixel (Quá sáng hoặc quá tối trước khi Clamp)
         p_min = intermediate_preds[0].min().item()
         p_max = intermediate_preds[0].max().item()
         print(f"[-] Dải giá trị thô của Loop 1 (Chưa clamp) : Lớn nhất = {p_max:.4f} | Nhỏ nhất = {p_min:.4f}")
 
-        # Đưa ra kết luận định hướng sửa lỗi
         if diff_last_first == 0.0:
-            print("\n[🚨 KẾT LUẬN CỦA BIÊN DỊCH]: CÁC TENSOR TRÙNG NHAU 100% VỀ MẶT TOÁN HỌC!")
-            print("   -> Lõi Bottleneck đang hoàn toàn bị đóng băng hoặc không biến đổi trạng thái ẩn qua các vòng.")
+            print("\n[🚨 KẾT LUẬN]: CÁC TENSOR TRÙNG NHAU 100% VỀ MẶT TOÁN HỌC!")
+            print("   -> Lõi Bottleneck đang bị đóng băng hoàn toàn qua các vòng.")
         elif diff_last_first < 1e-4:
-            print("\n[🚨 KẾT LUẬN CỦA BIÊN DỊCH]: CÓ SỰ KHÁC BIỆT NHƯNG SIÊU NHỎ (< 0.0001)!")
+            print("\n[🚨 KẾT LUẬN]: CÓ SỰ KHÁC BIỆT NHƯNG SIÊU NHỎ (< 0.0001)!")
             print("   -> Đặc trưng bị 'nuốt chửng' bởi nhánh Skip Connection quá lớn từ Encoder gửi sang.")
         else:
-            print("\n[✅ KẾT LUẬN CỦA BIÊN DỊCH]: VỀ MẶT TOÁN HỌC CÁC TENSOR KHÁC NHAU RÕ RÀNG!")
-            print("   -> Đồ thị mạng lặp chạy chuẩn. Lỗi ảnh giống hệt nhau nằm ở logic gán đè biến của hàm log_loop_steps.")
+            print("\n[✅ KẾT LUẬN]: VỀ MẶT TOÁN HỌC CÁC TENSOR KHÁC NHAU RÕ RÀNG!")
+            print("   -> Đồ thị mạng lặp chạy chuẩn. Kiểm tra lại giá trị khởi tạo LayerScale hoặc cờ AMP.")
             
-    if halt_logits is not None:
+    if halting_weights is not None:
         print(f"[-] Phân phối Trọng số Dừng (Halt Weights Avg): {[f'{w.mean().item():.3f}' for w in halting_weights]}")
     print("="*88 + "\n")
 
@@ -149,14 +146,13 @@ def inspect_gradient_flow(model):
                 
     if not has_bottleneck_grad:
         print("\n[🚨 NGUY HIỂM]: Toàn bộ khối Bottleneck nhận Đạo hàm bằng 0 hoặc None!")
-        print("   -> Optimizer đang bị lệch cấu trúc thiết bị (GPU/CPU) hoặc đồ thị Backward bị đứt gãy.")
     else:
         print("\n[✅ ỔN ĐỊNH]: Khối lặp có nhận được tín hiệu điều chỉnh đạo hàm từ hàm Loss.")
     print("="*88 + "\n")
 
 
 # =========================================================
-# TRAIN ONE EPOCH (TÍCH HỢP CHẨN ĐOÁN TRỰC TIẾP)
+# TRAIN ONE EPOCH
 # =========================================================
 
 def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, cfg, aug=None, stage=1, global_step=0):
@@ -184,7 +180,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
             outputs = model(inp, return_all=True)
             pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
 
-            # 🛠️ DEBUG ĐIỂM 1: Kiểm tra đột biến toán học ở Batch đầu tiên của Epoch
+            # Kiểm tra đột biến toán học ở Batch đầu tiên của Epoch
             if batch_idx == 0:
                 inspect_loop_dynamics(intermediate_preds, halting_weights, gate_logits)
 
@@ -207,17 +203,12 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
 
         scaler.scale(loss).backward()
         
-        # 🛠️ DEBUG ĐIỂM 2: Kiểm tra dòng chảy đạo hàm trước khi Optimizer bước đi
+        # Kiểm tra dòng chảy đạo hàm trước khi Optimizer bước đi
         if batch_idx == 0:
             inspect_gradient_flow(model)
 
         scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            cfg.grad_clip
-        )
-
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
@@ -254,42 +245,72 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
 
 
 # =========================================================
-# VALIDATION
+# VALIDATION (ĐÃ SỬA: THEO DÕI CHỈ SỐ TỪNG VÒNG LẶP TOÀN TẬP VAL)
 # =========================================================
 
 @torch.no_grad()
 def validate(model, loader, device, global_step=0, log_images=True):
     model.eval()
 
+    loop_psnr_sums = None
+    loop_ssim_sums = None
+    
     psnr_sum = 0.0
     ssim_sum = 0.0
     ms_ssim_sum = 0.0
     rmse_sum = 0.0
-    total = 0
+    total_images = 0
 
-    for i, batch in enumerate(tqdm(loader, desc="Validating")):
+    for i, batch in enumerate(tqdm(loader, desc="Validating Progressively")):
         inp = batch["inp"].to(device)
         gt = batch["gt"].to(device)
 
+        # Ép mô hình trả về toàn bộ các vòng lặp để tính toán chỉ số đối chứng
+        outputs = model(inp, return_all=True)
+        pred, inter_preds, halt_w, halt_logits, _ = outputs
+
+        T = len(inter_preds)
+        batch_size = inp.size(0)
+
+        # Khởi tạo mảng tích lũy động theo số lượng loop thực tế
+        if loop_psnr_sums is None:
+            loop_psnr_sums = [0.0] * T
+            loop_ssim_sums = [0.0] * T
+
+        # Phân rã batch tính toán độc lập từng ảnh (Tránh hiện tượng lệch trung bình log)
+        for b in range(batch_size):
+            g_img = gt[b:b+1]
+            
+            psnr_sum += compute_psnr(pred[b:b+1], g_img)
+            ssim_sum += compute_ssim(pred[b:b+1], g_img)
+            ms_ssim_sum += compute_ms_ssim(pred[b:b+1], g_img)
+            rmse_sum += compute_rmse(pred[b:b+1], g_img)
+            
+            # Tính toán chỉ số riêng cho từng bước sửa đổi tịnh tiến
+            for t in range(T):
+                loop_psnr_sums[t] += compute_psnr(inter_preds[t][b:b+1], g_img)
+                loop_ssim_sums[t] += compute_ssim(inter_preds[t][b:b+1], g_img)
+                
+            total_images += 1
+
+        # Chỉ log ảnh mẫu cho batch đầu tiên lên giao diện Wandb
         if i == 0 and log_images:
-            outputs = model(inp, return_all=True)
-            pred, inter_preds, halt_w, halt_logits, _ = outputs
             log_loop_steps(inp, gt, inter_preds, halt_w, halt_logits, global_step)
-        else:
-            pred = model(inp)
 
-        psnr_sum += compute_psnr(pred, gt)
-        ssim_sum += compute_ssim(pred, gt)
-        ms_ssim_sum += compute_ms_ssim(pred, gt)
-        rmse_sum += compute_rmse(pred, gt)
-        total += 1
-
-    return {
-        "val/psnr": psnr_sum / total,
-        "val/ssim": ssim_sum / total,
-        "val/ms_ssim": ms_ssim_sum / total,
-        "val/rmse": rmse_sum / total,
+    # Đóng gói chỉ số trung bình tổng của trạng thái Final
+    val_metrics = {
+        "val/psnr": psnr_sum / total_images,
+        "val/ssim": ssim_sum / total_images,
+        "val/ms_ssim": ms_ssim_sum / total_images,
+        "val/rmse": rmse_sum / total_images,
     }
+    
+    # Bung chỉ số của từng Loop lên hệ thống biểu đồ Wandb để theo dõi xu hướng
+    for t in range(T):
+        val_metrics[f"val_loops/loop_{t+1}_psnr"] = loop_psnr_sums[t] / total_images
+        val_metrics[f"val_loops/loop_{t+1}_ssim"] = loop_ssim_sums[t] / total_images
+
+    return val_metrics
 
 
 # =========================================================
@@ -319,6 +340,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         val_metrics = validate(model, val_loader, device, global_step=global_step)
         scheduler.step()
 
+        # Log epoch summary (Tự động cập nhật đồ thị các đường loop_1, loop_2,...)
         wandb.log({
             "epoch": epoch,
             "train/loss_epoch": train_loss,
