@@ -40,6 +40,33 @@ class LayerScale(nn.Module):
     def forward(self, x):
         return x * self.scale.view(1, -1, 1, 1)
 
+class ResidualRepConv(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=1, deploy=False):
+        super().__init__()
+        self.deploy = deploy
+        self.conv_1 = RepConv3(in_channels, out_channels, groups, deploy=deploy)
+        self.act_1 = nn.GELU()
+        
+        self.conv_2 = RepConv3(out_channels, out_channels, groups, deploy=deploy)
+        self.act_2 = nn.GELU()
+
+    def fuse(self):
+        if not self.deploy:
+            self.conv_1.fuse()
+            self.conv_2.fuse()
+            
+            if hasattr(self.conv_1, 'deploy'): self.conv_1.deploy = True
+            if hasattr(self.conv_2, 'deploy'): self.conv_2.deploy = True
+            
+            self.deploy = True
+
+    def forward(self, x):
+        out = self.conv_1(x)
+        out = self.act_1(out)
+        out = self.conv_2(out)
+        out = self.act_2(out)
+        return out + x
+
 class BottleneckLayer(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -142,7 +169,7 @@ class ShallowExtractor(nn.Module):
 
 
 class EncoderStage(nn.Module):
-    def __init__(self, in_channels, out_channels, deploy=False):
+    def __init__(self, in_channels, out_channels, num_blocks=1, deploy=False):
         super().__init__()
         self.conv = RepConv3(in_channels, out_channels, deploy=deploy)
         self.act = nn.GELU()
@@ -151,15 +178,24 @@ class EncoderStage(nn.Module):
         self.channel_compress = nn.Conv2d(out_channels * 4, out_channels, kernel_size=1, bias=False)
         self.act_down = nn.GELU()
 
+        self.stacked_layers = nn.ModuleList([
+            ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
+            for _ in range(num_blocks)
+        ])
+
     def forward(self, x):
         feat = self.act(self.conv(x))
         downsampled = self.down(feat)
         downsampled = self.act_down(self.channel_compress(downsampled))
+
+        for layer in self.stacked_layers:
+            downsampled = layer(downsampled)
+            
         return feat, downsampled
 
 
 class DecoderStage(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, deploy=False):
+    def __init__(self, in_channels, skip_channels, out_channels, num_blocks=1, deploy=False):
         super().__init__()
         self.expand_channels = nn.Conv2d(
             in_channels, 
@@ -173,62 +209,58 @@ class DecoderStage(nn.Module):
         self.conv = RepConv3(in_channels + skip_channels, out_channels, deploy=deploy)
         self.act = nn.GELU()
 
+        self.stacked_layers = nn.ModuleList([
+            ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
+            for _ in range(num_blocks)
+        ])
+
     def forward(self, x, skip_feat):
         x = self.expand_channels(x)
         x = self.up(x)
         x = self.act_up(x)
         x = torch.cat([x, skip_feat], dim=1)
-        return self.act(self.conv(x))
+        x = self.act(self.conv(x))
+        
+        for layer in self.stacked_layers:
+            x = layer(x)
+            
+        return x
 
 
 class LoopRepDocEnhanceNet(nn.Module):
-    def __init__(self, base_dim=32, max_loops=4, deploy=False):
+    def __init__(self, base_dim=32, max_loops=4, enc_blocks=[2, 2, 4], dec_blocks=[2, 2, 2], deploy=False):
         super().__init__()
         self.base_dim = base_dim
         
-        # Shallow Extraction (H, W) -> base_dim (Kênh 32)
+        if isinstance(enc_blocks, int):
+            enc_blocks = [enc_blocks] * 3
+        if isinstance(dec_blocks, int):
+            dec_blocks = [dec_blocks] * 3
+            
         self.shallow_extractor = ShallowExtractor(3, base_dim, deploy=deploy)
         
-        # Encoder Blocks (Hạ không gian từ 1/1 xuống 1/8)
-        self.enc1 = EncoderStage(base_dim, base_dim, deploy=deploy)         # 1/1 -> 1/2
-        self.enc2 = EncoderStage(base_dim, base_dim * 2, deploy=deploy)     # 1/2 -> 1/4
-        self.enc3 = EncoderStage(base_dim * 2, base_dim * 4, deploy=deploy) # 1/4 -> 1/8
+        self.enc1 = EncoderStage(base_dim, base_dim, num_blocks=enc_blocks[0], deploy=deploy)
+        self.enc2 = EncoderStage(base_dim, base_dim * 2, num_blocks=enc_blocks[1], deploy=deploy)
+        self.enc3 = EncoderStage(base_dim * 2, base_dim * 4, num_blocks=enc_blocks[2], deploy=deploy)
         
-        # Bottleneck thích ứng lõi động (Chạy ở scale 1/8)
         self.bottleneck = AdaptiveLoopedBottleneck(dim=base_dim * 4, max_loops=max_loops)
         
-        # Decoder Blocks (Khôi phục không gian từ 1/8 lên lại 1/1)
-        self.dec3 = DecoderStage(base_dim * 4, base_dim * 4, base_dim * 2, deploy=deploy) # 1/8 -> 1/4
-        self.dec2 = DecoderStage(base_dim * 2, base_dim * 2, base_dim, deploy=deploy)     # 1/4 -> 1/2
-        self.dec1 = DecoderStage(base_dim, base_dim, base_dim, deploy=deploy)             # 1/2 -> 1/1
+        self.dec3 = DecoderStage(base_dim * 4, base_dim * 4, base_dim * 2, num_blocks=dec_blocks[2], deploy=deploy)
+        self.dec2 = DecoderStage(base_dim * 2, base_dim * 2, base_dim, num_blocks=dec_blocks[1], deploy=deploy)
+        self.dec1 = DecoderStage(base_dim, base_dim, base_dim, num_blocks=dec_blocks[0], deploy=deploy)
         
-        # Output Head: Dự đoán phần dư toàn cục (Global Residual Mapping)
         self.final_head = nn.Sequential(
             RepConv3(base_dim, base_dim, deploy=deploy),
             nn.GELU(),
             nn.Conv2d(base_dim, 3, kernel_size=3, padding=1)
         )
 
-
-    def _decode(
-        self,
-        bottleneck_feat,
-        skip1,
-        skip2,
-        skip3,
-        x_ori
-    ):
-
+    def _decode(self, bottleneck_feat, skip1, skip2, skip3, x_ori):
         d3 = self.dec3(bottleneck_feat, skip3)
-
         d2 = self.dec2(d3, skip2)
-
         d1 = self.dec1(d2, skip1)
-
         residual = self.final_head(d1)
-
         output = x_ori + residual
-
         return output
 
     def forward(self, x, halt_threshold=0.80, return_all=False):
