@@ -5,8 +5,7 @@ import torch
 import torch.nn as nn
 from fvcore.nn import FlopCountAnalysis
 
-# Giả định import chính xác từ project của bạn
-# from src.model.loop_rep.model import LoopRepDocEnhanceNet, AdaptiveLoopedBottleneck
+from src.model.loop_rep.model import LoopRepDocEnhanceNet, AdaptiveLoopedBottleneck
 
 ATOL = 1e-4
 
