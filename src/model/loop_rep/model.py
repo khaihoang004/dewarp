@@ -72,11 +72,15 @@ class BottleneckLayer(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = RestormerAttention(dim)
-        self.norm2 = RMSNorm(dim)
-        self.ffn = SwiGLU_FFN(dim)
+        self.scale1 = LayerScale(dim, init_value=0.1)  # Sau Attention
         
-        self.scale1 = LayerScale(dim, init_value=0.1)  # sau Attention
-        self.scale2 = LayerScale(dim, init_value=0.1)  # sau FFN
+        self.norm2 = RMSNorm(dim)
+        self.ffn1 = SwiGLU_FFN(dim)
+        self.scale2 = LayerScale(dim, init_value=0.1)  # Sau FFN 1
+        
+        self.norm3 = RMSNorm(dim)
+        self.ffn2 = SwiGLU_FFN(dim)
+        self.scale3 = LayerScale(dim, init_value=0.1)  # Sau FFN 2
 
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -86,11 +90,9 @@ class BottleneckLayer(nn.Module):
         )
 
     def forward(self, x):
-        attn_out = self.attn(self.norm1(x))
-        x = x + self.scale1(attn_out)
-        
-        ffn_out = self.ffn(self.norm2(x))
-        x = x + self.scale2(ffn_out)
+        x = x + self.scale1(self.attn(self.norm1(x)))
+        x = x + self.scale2(self.ffn1(self.norm2(x)))
+        x = x + self.scale3(self.ffn2(self.norm3(x)))
         
         gate_logits = self.gate(x)
         exit_prob = torch.sigmoid(gate_logits).view(-1)
@@ -182,6 +184,8 @@ class EncoderStage(nn.Module):
             ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
             for _ in range(num_blocks)
         ])
+        self.norm_feat = RMSNorm(out_channels)
+        self.norm_down = RMSNorm(out_channels)
 
     def forward(self, x):
         feat = self.act(self.conv(x))
@@ -191,7 +195,7 @@ class EncoderStage(nn.Module):
         for layer in self.stacked_layers:
             downsampled = layer(downsampled)
             
-        return feat, downsampled
+        return self.norm_feat(feat), self.norm_down(downsampled)
 
 
 class DecoderStage(nn.Module):
@@ -210,6 +214,8 @@ class DecoderStage(nn.Module):
             ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
             for _ in range(num_blocks)
         ])
+        
+        self.norm_out = RMSNorm(out_channels)
 
     def forward(self, x, skip_feat):
         x = self.expand_channels(x)
@@ -225,7 +231,7 @@ class DecoderStage(nn.Module):
         for layer in self.stacked_layers:
             x = layer(x)
             
-        return x
+        return self.norm_out(x)
 
 
 class LoopRepDocEnhanceNet(nn.Module):
