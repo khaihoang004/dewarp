@@ -67,20 +67,44 @@ class ResidualRepConv(nn.Module):
         out = self.act_2(out)
         return out + x
 
-class BottleneckLayer(nn.Module):
-    def __init__(self, dim):
+class BottleneckBlock(nn.Module):
+    def __init__(self, dim, deploy=False):
         super().__init__()
+        # Global (Attention)
         self.norm1 = RMSNorm(dim)
         self.attn = RestormerAttention(dim)
-        self.scale1 = LayerScale(dim, init_value=1e-4)  # Sau Attention
+        self.scale1 = LayerScale(dim, init_value=1e-4)
         
+        # Local (Convolution)
         self.norm2 = RMSNorm(dim)
-        self.ffn1 = SwiGLU_FFN(dim)
-        self.scale2 = LayerScale(dim, init_value=1e-4)  # Sau FFN 1
+        self.conv = RepConv3(dim, dim, groups=1, deploy=deploy)
+        self.scale2 = LayerScale(dim, init_value=1e-4)
         
+        # Channel (FFN)
         self.norm3 = RMSNorm(dim)
-        self.ffn2 = SwiGLU_FFN(dim)
-        self.scale3 = LayerScale(dim, init_value=1e-4)  # Sau FFN 2
+        self.ffn = SwiGLU_FFN(dim)
+        self.scale3 = LayerScale(dim, init_value=1e-4)
+        
+    def forward(self, x):
+        x = x + self.scale1(self.attn(self.norm1(x)))
+        x = x + self.scale2(self.conv(self.norm2(x)))
+        x = x + self.scale3(self.ffn(self.norm3(x)))
+        return x
+
+class BottleneckLayer(nn.Module):
+    def __init__(self, dim, num_hybrid_blocks=2):
+        super().__init__()
+        
+        self.condition_fusion = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim) 
+        )
+        self.norm_in = RMSNorm(dim)
+
+        self.blocks = nn.ModuleList([
+            BottleneckBlock(dim) for _ in range(num_hybrid_blocks)
+        ])
 
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -89,11 +113,14 @@ class BottleneckLayer(nn.Module):
             nn.Conv2d(dim // 4, 1, kernel_size=1)
         )
 
-    def forward(self, x):
-        x = x + self.scale1(self.attn(self.norm1(x)))
-        x = x + self.scale2(self.ffn1(self.norm2(x)))
-        x = x + self.scale3(self.ffn2(self.norm3(x)))
+    def forward(self, x, x_orig):
+        norm_x = self.norm_in(x)
+        condition = self.condition_fusion(torch.cat([norm_x, x_orig], dim=1))
+        x = x + condition 
         
+        for block in self.blocks:
+            x = block(x)
+            
         gate_logits = self.gate(x)
         exit_prob = torch.sigmoid(gate_logits).view(-1)
 
@@ -110,6 +137,8 @@ class AdaptiveLoopedBottleneck(nn.Module):
         B = x.shape[0]
         device = x.device
 
+        x_orig = x.detach() if not self.training else x
+
         if self.training or return_all:
             states = []
             exit_probs = []          # list of (B,)
@@ -118,7 +147,7 @@ class AdaptiveLoopedBottleneck(nn.Module):
             state = x
 
             for _ in range(self.max_loops):
-                state, g_logits, lambda_t = self.layer(state)
+                state, g_logits, lambda_t = self.layer(state, x_orig)
                 states.append(state)
                 exit_probs.append(lambda_t)
                 gate_logits_list.append(g_logits)
@@ -150,7 +179,7 @@ class AdaptiveLoopedBottleneck(nn.Module):
             cumulative = torch.zeros(B, device=device)
 
             for t in range(self.max_loops):
-                state, _, lambda_t = self.layer(state)
+                state, _, lambda_t = self.layer(state, x_orig)
                 survival = (1.0 - cumulative).clamp(min=1e-6)
                 cumulative = torch.clamp(cumulative + lambda_t * survival, min=0.0, max=1.0)
                 
