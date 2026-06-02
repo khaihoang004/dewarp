@@ -72,15 +72,15 @@ class BottleneckLayer(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = RestormerAttention(dim)
-        self.scale1 = LayerScale(dim, init_value=0.1)  # Sau Attention
+        self.scale1 = LayerScale(dim, init_value=1e-4)  # Sau Attention
         
         self.norm2 = RMSNorm(dim)
         self.ffn1 = SwiGLU_FFN(dim)
-        self.scale2 = LayerScale(dim, init_value=0.1)  # Sau FFN 1
+        self.scale2 = LayerScale(dim, init_value=1e-4)  # Sau FFN 1
         
         self.norm3 = RMSNorm(dim)
         self.ffn2 = SwiGLU_FFN(dim)
-        self.scale3 = LayerScale(dim, init_value=0.1)  # Sau FFN 2
+        self.scale3 = LayerScale(dim, init_value=1e-4)  # Sau FFN 2
 
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
