@@ -205,26 +205,29 @@ class EncoderStage(nn.Module):
         self.conv = RepConv3(in_channels, out_channels, deploy=deploy)
         self.act = nn.GELU()
 
-        self.down = nn.PixelUnshuffle(downscale_factor=2)
-        self.channel_compress = nn.Conv2d(out_channels * 4, out_channels, kernel_size=1, bias=False)
-        self.act_down = nn.GELU()
-
         self.stacked_layers = nn.ModuleList([
             ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
             for _ in range(num_blocks)
         ])
         self.norm_feat = RMSNorm(out_channels)
+
+        self.down = nn.PixelUnshuffle(downscale_factor=2)
+        self.channel_compress = nn.Conv2d(out_channels * 4, out_channels, kernel_size=1, bias=False)
+        self.act_down = nn.GELU()
         self.norm_down = RMSNorm(out_channels)
 
     def forward(self, x):
         feat = self.act(self.conv(x))
-        downsampled = self.down(feat)
-        downsampled = self.act_down(self.channel_compress(downsampled))
 
         for layer in self.stacked_layers:
-            downsampled = layer(downsampled)
+            feat = layer(feat)
             
-        return self.norm_feat(feat), self.norm_down(downsampled)
+        skip_feat = self.norm_feat(feat)
+
+        downsampled = self.down(skip_feat)
+        downsampled = self.act_down(self.channel_compress(downsampled))
+
+        return skip_feat, self.norm_down(downsampled)
 
 
 class DecoderStage(nn.Module):
