@@ -1,3 +1,5 @@
+import os
+import random
 import torch
 import wandb
 from tqdm import tqdm
@@ -5,10 +7,6 @@ import numpy as np
 from torch.amp import autocast, GradScaler
 from pytorch_msssim import ms_ssim, ssim
 
-
-# =========================================================
-# METRICS (TÍNH TOÁN THEO TỪNG ẢNH ĐƠN LẺ)
-# =========================================================
 
 @torch.no_grad()
 def compute_psnr(pred, target):
@@ -36,10 +34,6 @@ def compute_ms_ssim(pred, target):
 def compute_rmse(pred, target):
     return torch.sqrt(torch.mean((pred - target) ** 2)).item()
 
-
-# =========================================================
-# VISUAL + LOGGING WANDB
-# =========================================================
 
 def make_vis(inp, pred, gt):
     psnr = compute_psnr(pred, gt)
@@ -82,9 +76,10 @@ def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, gl
             exit_prob = torch.sigmoid(halt_logits[t][b]).mean().item() if halt_logits is not None else 0.0
             act_w = halting_weights[t][b].mean().item()
 
-            caption = (f"Loop {t+1}/{T} | Exit: {exit_prob*100:.1f}% | "
+            caption = (f"{t+1}/{T} | Exit: {exit_prob*100:.1f}% | "
                       f"Weight: {act_w:.3f} | PSNR={metrics['psnr']:.2f} | "
-                      f"SSIM={metrics['ssim']:.4f} | MS-SIM={metrics['ms_ssim']:.4f}")
+                      f"RMSE={metrics['rmse']:.4f} | "
+                      f"SSIM={metrics['ssim']:.4f} | MS-SSIM={metrics['ms_ssim']:.4f}")
 
             loop_images.append(wandb.Image(vis, caption=caption))
 
@@ -93,85 +88,33 @@ def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, gl
     wandb.log(log_dict, step=global_step)
 
 
-# =========================================================
-# 🛑 HỆ THỐNG CHẨN ĐOÁN SỐ HỌC TERMINAL
-# =========================================================
-
-def inspect_loop_dynamics(intermediate_preds, halting_weights, halt_logits):
-    """Kiểm tra sự tiến hóa số học giữa các vòng lặp để cô lập lỗi hiển thị."""
-    print("\n" + "="*30 + " TRÌNH CHẨN ĐOÁN LÕI LẶP ĐỘNG " + "="*30)
-    T = len(intermediate_preds)
-    print(f"[*] Tổng số vòng lặp nhận được từ Model: {T}")
-    
-    if T > 1:
-        diff_1_2 = (intermediate_preds[1] - intermediate_preds[0]).abs().max().item()
-        diff_last_first = (intermediate_preds[-1] - intermediate_preds[0]).abs().max().item()
-        
-        print(f"[*] Sai lệch toán học Max (|Loop 2 - Loop 1|): {diff_1_2:.8f}")
-        print(f"[*] Sai lệch toán học Max (|Loop Cuối - Loop 1|): {diff_last_first:.8f}")
-        
-        p_min = intermediate_preds[0].min().item()
-        p_max = intermediate_preds[0].max().item()
-        print(f"[-] Dải giá trị thô của Loop 1 (Chưa clamp) : Lớn nhất = {p_max:.4f} | Nhỏ nhất = {p_min:.4f}")
-
-        if diff_last_first == 0.0:
-            print("\n[🚨 KẾT LUẬN]: CÁC TENSOR TRÙNG NHAU 100% VỀ MẶT TOÁN HỌC!")
-            print("   -> Lõi Bottleneck đang bị đóng băng hoàn toàn qua các vòng.")
-        elif diff_last_first < 1e-4:
-            print("\n[🚨 KẾT LUẬN]: CÓ SỰ KHÁC BIỆT NHƯNG SIÊU NHỎ (< 0.0001)!")
-            print("   -> Đặc trưng bị 'nuốt chửng' bởi nhánh Skip Connection quá lớn từ Encoder gửi sang.")
-        else:
-            print("\n[✅ KẾT LUẬN]: VỀ MẶT TOÁN HỌC CÁC TENSOR KHÁC NHAU RÕ RÀNG!")
-            print("   -> Đồ thị mạng lặp chạy chuẩn. Kiểm tra lại giá trị khởi tạo LayerScale hoặc cờ AMP.")
-            
-    if halting_weights is not None:
-        print(f"[-] Phân phối Trọng số Dừng (Halt Weights Avg): {[f'{w.mean().item():.3f}' for w in halting_weights]}")
-    print("="*88 + "\n")
-
-
-def inspect_gradient_flow(model):
-    """Kiểm tra độ lớn Đạo hàm (Grad) để xác định xem tầng Bottleneck có được tối ưu không."""
-    print("="*30 + " KIỂM TRA ĐỒ THỊ GRADIENT " + "="*30)
-    has_bottleneck_grad = False
-    
-    for name, param in model.named_parameters():
-        if "bottleneck" in name:
-            if param.grad is not None:
-                grad_norm = param.grad.abs().sum().item()
-                print(f"[GRAD] Tầng lặp: {name:<50} | Tổng Grad tích lũy = {grad_norm:.8f}")
-                if grad_norm > 0:
-                    has_bottleneck_grad = True
-            else:
-                print(f"[GRAD] Tầng lặp: {name:<50} | Không tìm thấy Đạo hàm (Grad là None)!")
-                
-    if not has_bottleneck_grad:
-        print("\n[🚨 NGUY HIỂM]: Toàn bộ khối Bottleneck nhận Đạo hàm bằng 0 hoặc None!")
-    else:
-        print("\n[✅ ỔN ĐỊNH]: Khối lặp có nhận được tín hiệu điều chỉnh đạo hàm từ hàm Loss.")
-    print("="*88 + "\n")
-
-
-# =========================================================
-# TRAIN ONE EPOCH
-# =========================================================
-
-def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, cfg, aug=None, stage=1, global_step=0):
+def train_one_epoch(
+    model, loader, optimizer, scaler, criterion, device, epoch, cfg, 
+    aug=None, stage=1, global_step=0,
+    accumulation_steps=4, max_steps_per_epoch=500
+):
     model.train()
     running_loss = 0.0
 
+    total_steps = min(len(loader), max_steps_per_epoch)
+
     pbar = tqdm(
         loader,
+        total=total_steps,
         desc=f"Train Epoch {epoch} | Stage {stage}"
     )
 
+    optimizer.zero_grad(set_to_none=True)
+
     for batch_idx, batch in enumerate(pbar):
+        if batch_idx >= total_steps:
+            break
+
         inp = batch["inp"].to(device, non_blocking=True)
         gt = batch["gt"].to(device, non_blocking=True)
 
         if aug is not None:
             inp, gt = aug(inp, gt)
-
-        optimizer.zero_grad(set_to_none=True)
 
         with autocast(
             device_type="cuda",
@@ -179,10 +122,6 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
         ):
             outputs = model(inp, return_all=True)
             pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
-
-            # Kiểm tra đột biến toán học ở Batch đầu tiên của Epoch
-            if batch_idx == 0:
-                inspect_loop_dynamics(intermediate_preds, halting_weights, gate_logits)
 
             if stage == 1:
                 loss, loss_dict = criterion(
@@ -201,20 +140,20 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
                     halt_logits=gate_logits
                 )
 
+        loss_raw = loss.item()
+
+        loss = loss / accumulation_steps
         scaler.scale(loss).backward()
-        
-        # Kiểm tra dòng chảy đạo hàm trước khi Optimizer bước đi
-        if batch_idx == 0:
-            inspect_gradient_flow(model)
 
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-        running_loss += loss.item()
+        running_loss += loss_raw
 
-        # Tính toán các chỉ số vòng lặp để log
         halt_stack = torch.stack([
             h.mean(dim=tuple(range(1, h.dim())))
             for h in halting_weights
@@ -229,9 +168,9 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
         expected_steps = (step_ids * halt_stack).sum(dim=0).mean().item()
         hard_steps = halt_stack.argmax(dim=0).float().mean().item() + 1
 
-        if batch_idx == len(loader) - 1:
+        if batch_idx == total_steps - 1:
             wandb.log({
-                "train/loss": loss.item(),
+                "train/loss": loss_raw,
                 "train/expected_steps": expected_steps,
                 "train/hard_steps": hard_steps,
                 "lr": optimizer.param_groups[0]["lr"],
@@ -239,15 +178,12 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, epoch, 
             }, step=global_step)
 
         global_step += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}", steps=f"{expected_steps:.2f}")
+        pbar.set_postfix(loss=f"{loss_raw:.4f}", steps=f"{expected_steps:.2f}")
 
-    return running_loss / len(loader), global_step
+    return running_loss / total_steps, global_step
 
 
-# =========================================================
-# VALIDATION (ĐÃ SỬA: THEO DÕI CHỈ SỐ TỪNG VÒNG LẶP TOÀN TẬP VAL)
-# =========================================================
-
+# VALIDATION
 @torch.no_grad()
 def validate(model, loader, device, global_step=0, log_images=True):
     model.eval()
@@ -265,19 +201,16 @@ def validate(model, loader, device, global_step=0, log_images=True):
         inp = batch["inp"].to(device)
         gt = batch["gt"].to(device)
 
-        # Ép mô hình trả về toàn bộ các vòng lặp để tính toán chỉ số đối chứng
         outputs = model(inp, return_all=True)
         pred, inter_preds, halt_w, halt_logits, _ = outputs
 
         T = len(inter_preds)
         batch_size = inp.size(0)
 
-        # Khởi tạo mảng tích lũy động theo số lượng loop thực tế
         if loop_psnr_sums is None:
             loop_psnr_sums = [0.0] * T
             loop_ssim_sums = [0.0] * T
 
-        # Phân rã batch tính toán độc lập từng ảnh (Tránh hiện tượng lệch trung bình log)
         for b in range(batch_size):
             g_img = gt[b:b+1]
             
@@ -286,18 +219,15 @@ def validate(model, loader, device, global_step=0, log_images=True):
             ms_ssim_sum += compute_ms_ssim(pred[b:b+1], g_img)
             rmse_sum += compute_rmse(pred[b:b+1], g_img)
             
-            # Tính toán chỉ số riêng cho từng bước sửa đổi tịnh tiến
             for t in range(T):
                 loop_psnr_sums[t] += compute_psnr(inter_preds[t][b:b+1], g_img)
                 loop_ssim_sums[t] += compute_ssim(inter_preds[t][b:b+1], g_img)
                 
             total_images += 1
 
-        # Chỉ log ảnh mẫu cho batch đầu tiên lên giao diện Wandb
         if i == 0 and log_images:
             log_loop_steps(inp, gt, inter_preds, halt_w, halt_logits, global_step)
 
-    # Đóng gói chỉ số trung bình tổng của trạng thái Final
     val_metrics = {
         "val/psnr": psnr_sum / total_images,
         "val/ssim": ssim_sum / total_images,
@@ -305,7 +235,6 @@ def validate(model, loader, device, global_step=0, log_images=True):
         "val/rmse": rmse_sum / total_images,
     }
     
-    # Bung chỉ số của từng Loop lên hệ thống biểu đồ Wandb để theo dõi xu hướng
     for t in range(T):
         val_metrics[f"val_loops/loop_{t+1}_psnr"] = loop_psnr_sums[t] / total_images
         val_metrics[f"val_loops/loop_{t+1}_ssim"] = loop_ssim_sums[t] / total_images
@@ -313,14 +242,14 @@ def validate(model, loader, device, global_step=0, log_images=True):
     return val_metrics
 
 
-# =========================================================
 # MAIN TRAINING LOOP
-# =========================================================
-
 def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion, device, cfg, aug=None, stage=1):
     scaler = GradScaler(enabled=cfg.use_amp)
     best_psnr = 0.0
     global_step = 0
+
+    accumulation_steps = getattr(cfg, "accumulation_steps", 4)
+    max_steps_per_epoch = getattr(cfg, "max_steps_per_epoch", 500)
 
     for epoch in range(cfg.epochs):
         train_loss, global_step = train_one_epoch(
@@ -334,13 +263,14 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
             cfg=cfg,
             aug=aug,
             stage=stage,
-            global_step=global_step
+            global_step=global_step,
+            accumulation_steps=accumulation_steps,
+            max_steps_per_epoch=max_steps_per_epoch
         )
 
         val_metrics = validate(model, val_loader, device, global_step=global_step)
         scheduler.step()
 
-        # Log epoch summary (Tự động cập nhật đồ thị các đường loop_1, loop_2,...)
         wandb.log({
             "epoch": epoch,
             "train/loss_epoch": train_loss,
