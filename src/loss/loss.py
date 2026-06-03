@@ -84,15 +84,15 @@ class Stage1Loss(nn.Module):
         entropy_weight=0.05,
         entropy_warmdown_epochs=10,
 
-        prior_beta=0.08,
-        refine_weight=0.1,
-
-        freq_kernel=3,
-
+        refine_weight=0.05,
+        distillation_weight=0.35,      
+        freq_distill_weight=0.25,      
+        freq_kernel=5,                 
+        
         # frequency
         low_weight=0.5,
         high_weight=1.2,
-
+        
         # global weights
         w_spatial=1.0,
         w_freq=1.0,
@@ -104,8 +104,9 @@ class Stage1Loss(nn.Module):
 
         self.entropy_weight = entropy_weight
         self.entropy_warmdown_epochs = entropy_warmdown_epochs
-        self.prior_beta = prior_beta
         self.refine_weight = refine_weight
+        self.distillation_weight = distillation_weight
+        self.freq_distill_weight = freq_distill_weight
 
         self.low_weight = low_weight
         self.high_weight = high_weight
@@ -122,15 +123,12 @@ class Stage1Loss(nn.Module):
         self.vgg_loss = VGGPerceptualLoss()
 
     def get_entropy_weight(self, current_epoch):
+        min_weight = self.entropy_weight * 0.1
         if self.entropy_warmdown_epochs <= 0:
             return self.entropy_weight
-
-        progress = min(
-            current_epoch / self.entropy_warmdown_epochs,
-            1.0
-        )
-
-        return self.entropy_weight * (1.0 - progress)
+            
+        progress = min(current_epoch / self.entropy_warmdown_epochs, 1.0)
+        return min_weight + (self.entropy_weight - min_weight) * (1.0 - progress)
 
     # SSIM Warmup
     def get_ssim_weight(self, current_epoch):
@@ -143,7 +141,7 @@ class Stage1Loss(nn.Module):
 
         # Direct spatial reconstruction - Spatial Loss
         spatial_loss = self.charbonnier(pred, target, reduction='none')
-
+        
         # Frequency Loss
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
@@ -159,9 +157,7 @@ class Stage1Loss(nn.Module):
         target_safe = torch.clamp(target, 0.0, 1.0)
         ssim_loss = 1.0 - ssim(pred_safe, target_safe, data_range=1.0, size_average=False)
         if ssim_loss.ndim > 1:
-            ssim_loss = ssim_loss.mean(
-                dim=tuple(range(1, ssim_loss.ndim))
-            )
+            ssim_loss = ssim_loss.mean(dim=tuple(range(1, ssim_loss.ndim)))
 
         current_ssim_weight = self.get_ssim_weight(current_epoch)
 
@@ -173,17 +169,40 @@ class Stage1Loss(nn.Module):
         )
 
         return (
-            combined,
-            spatial_loss,
+            combined, 
+            spatial_loss, 
             loss_low,
-            loss_high,
-            perceptual_loss,
-            ssim_loss,
+            loss_high, 
+            perceptual_loss, 
+            ssim_loss, 
             current_ssim_weight,
         )
 
+    def compute_progressive_ilsd(self, intermediate_preds):
+        if len(intermediate_preds) < 2:
+            return 0.0
+            
+        distill_loss = 0.0
+        T = len(intermediate_preds)
+        
+        for t in range(T - 1):
+            student = intermediate_preds[t]
+            teacher = intermediate_preds[t + 1].detach()
+            
+            spatial_dist = F.l1_loss(student, teacher)
+            
+            _, student_high = self.freq_separator(student)
+            _, teacher_high = self.freq_separator(teacher)
+            high_dist = F.l1_loss(student_high, teacher_high)
+            
+            weight = (t + 1) / T
+            distill_loss += weight * (spatial_dist + self.freq_distill_weight * high_dist)
+        
+        return distill_loss / max(T - 1, 1)
+
     def forward(self, target, final_pred, intermediate_preds, halting_weights, current_epoch=0, **kwargs):
         T = len(intermediate_preds)
+
         rec_losses = []
         spatial_losses = []
 
@@ -195,11 +214,9 @@ class Stage1Loss(nn.Module):
         current_ssim_weight = 0.0
 
         for t in range(T):
-            (rec_t, spatial_t, low_t, high_t, 
-             perceptual_t, ssim_t, current_ssim_weight) = self.reconstruction_loss(
-                 intermediate_preds[t], target, current_epoch=current_epoch
-             )
-
+            (rec_t, spatial_t, low_t, high_t, perceptual_t, ssim_t, curr_ssim_w) = self.reconstruction_loss(
+                intermediate_preds[t], target, current_epoch
+            )
             rec_losses.append(rec_t)
             spatial_losses.append(spatial_t)
 
@@ -212,93 +229,50 @@ class Stage1Loss(nn.Module):
         rec_losses = torch.stack(rec_losses, dim=0)   # (T, B)
         spatial_losses = torch.stack(spatial_losses, dim=0)   # (T, B)
 
-        q = halting_weights / (
-            halting_weights.sum(dim=0, keepdim=True) + 1e-8
-        )
-
-        steps = torch.arange(
-            T,
-            device=q.device,
-            dtype=q.dtype
-        )
-
-        prior = torch.exp(
-            -self.prior_beta * steps
-        )
-
-        prior = prior / prior.sum()
-
-        weighted_rec_per_sample = torch.sum(
-            q * rec_losses,
-            dim=0
-        )
-        weighted_rec = weighted_rec_per_sample.mean()
+        q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
+        weighted_rec = torch.sum(q * rec_losses, dim=0).mean()
 
         refine_loss = 0.0
-
         for t in range(T - 1):
-
-            refine_loss += F.relu(
-                spatial_losses[t + 1]
-                - spatial_losses[t]
-            ).mean()
-
+            degradation = spatial_losses[t + 1] - spatial_losses[t] 
+            refine_loss += F.relu(degradation).mean()
         refine_loss /= max(T - 1, 1)
 
-        # Statistics
-        avg_spatial = (total_spatial / T).mean()
-        avg_low = (total_low / T).mean()
-        avg_high = (total_high / T).mean()
-        avg_perceptual = (total_perceptual / T).mean()
-        avg_ssim = (total_ssim / T).mean()
+        ilsd_loss = self.compute_progressive_ilsd(intermediate_preds)
 
         # KL Regularization for Ponder Gate
+        # KL(Halting || Uniform)
         hw_b = q.transpose(0, 1) # (T, B) -> (B, T)
         
-        # KL(Halting || Exponential)
-        prior_b = prior.view(1, T)
-
         kl_loss = torch.sum(
-            hw_b *
-            (
-                torch.log(hw_b + 1e-8)
-                - torch.log(prior_b + 1e-8)
-            ),
+            hw_b * (torch.log(hw_b + 1e-8) - math.log(1.0 / T)), 
             dim=1
         ).mean()
+        current_entropy_weight = self.get_entropy_weight(current_epoch)
 
-        current_entropy_weight = self.get_entropy_weight(
-            current_epoch
-        )
 
         total_loss = (
             weighted_rec
-            + current_entropy_weight * kl_loss
             + self.refine_weight * refine_loss
+            + self.distillation_weight * ilsd_loss
+            + current_entropy_weight * kl_loss
         )
 
         loss_dict = {
             "loss/total": total_loss.item(),
-
             "loss/rec": weighted_rec.item(),
-
-            "loss/spatial": avg_spatial.item(),
-            "loss/low_freq": avg_low.item(),
-            "loss/high_freq": avg_high.item(),
-
-            "loss/perceptual": avg_perceptual.item(),
-
-            "loss/ssim": avg_ssim.item(),
-            "loss/ssim_weight": current_ssim_weight,
-
             "loss/refine": refine_loss.item(),
-
-            "debug/q_mean": q.mean().item(),
-            "debug/q_max": q.max().item(),
-            "debug/q_min": q.min().item(),
-
+            "loss/ilsd": ilsd_loss.item(),
             "loss/kl_gate": kl_loss.item(),
             "loss/kl_weight": current_entropy_weight,
+            
+            "loss/spatial": (total_spatial / T).mean().item(),
+            "loss/low_freq": (total_low / T).mean().item(),
+            "loss/high_freq": (total_high / T).mean().item(),
+            "loss/ssim": (total_ssim / T).mean().item(),
+            
+            "debug/q_mean": q.mean().item(),
+            "debug/q_max": q.max().item(),
         }
 
         return total_loss, loss_dict
