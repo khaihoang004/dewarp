@@ -16,7 +16,19 @@ class RMSNorm(nn.Module):
         norm = x * torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + self.eps)
         return norm * self.weight.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
-# --- 3. Tầng SwiGLU Feed-Forward Network (Tối Ưu Tham Số) ---
+class LayerNorm2d(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        u = x.mean(dim=1, keepdim=True)
+        s = (x - u).pow(2).mean(dim=1, keepdim=True)
+        x = (x - u) * torch.rsqrt(s + self.eps)
+        return x * self.weight.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) + self.bias.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+
 class SwiGLU_FFN(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -71,19 +83,19 @@ class BottleneckBlock(nn.Module):
     def __init__(self, dim, deploy=False):
         super().__init__()
         # Global (Attention)
-        self.norm1 = RMSNorm(dim)
+        self.norm1 = LayerNorm2d(dim)
         self.attn = RestormerAttention(dim)
-        self.scale1 = LayerScale(dim, init_value=1e-4)
+        self.scale1 = LayerScale(dim, init_value=1e-2)
         
         # Local (Convolution)
-        self.norm2 = RMSNorm(dim)
+        self.norm2 = LayerNorm2d(dim)
         self.conv = RepConv3(dim, dim, groups=1, deploy=deploy)
-        self.scale2 = LayerScale(dim, init_value=1e-4)
+        self.scale2 = LayerScale(dim, init_value=1e-2)
         
         # Channel (FFN)
-        self.norm3 = RMSNorm(dim)
+        self.norm3 = LayerNorm2d(dim)
         self.ffn = SwiGLU_FFN(dim)
-        self.scale3 = LayerScale(dim, init_value=1e-4)
+        self.scale3 = LayerScale(dim, init_value=1e-2)
         
     def forward(self, x):
         x = x + self.scale1(self.attn(self.norm1(x)))
@@ -96,11 +108,12 @@ class BottleneckLayer(nn.Module):
         super().__init__()
         
         self.condition_fusion = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, kernel_size=1, bias=False),
+            nn.Conv2d(dim * 2, dim * 2, 1),
             nn.GELU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim) 
+            RepConv3(dim * 2, dim, groups=dim),
+            nn.GELU()
         )
-        self.norm_in = RMSNorm(dim)
+        self.norm_in = LayerNorm2d(dim)
 
         self.blocks = nn.ModuleList([
             BottleneckBlock(dim) for _ in range(num_hybrid_blocks)
@@ -209,12 +222,12 @@ class EncoderStage(nn.Module):
             ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
             for _ in range(num_blocks)
         ])
-        self.norm_feat = RMSNorm(out_channels)
+        self.norm_feat = LayerNorm2d(out_channels)
 
         self.down = nn.PixelUnshuffle(downscale_factor=2)
         self.channel_compress = nn.Conv2d(out_channels * 4, out_channels, kernel_size=1, bias=False)
         self.act_down = nn.GELU()
-        self.norm_down = RMSNorm(out_channels)
+        self.norm_down = LayerNorm2d(out_channels)
 
     def forward(self, x):
         feat = self.act(self.conv(x))
@@ -247,7 +260,7 @@ class DecoderStage(nn.Module):
             for _ in range(num_blocks)
         ])
         
-        self.norm_out = RMSNorm(out_channels)
+        self.norm_out = LayerNorm2d(out_channels)
 
     def forward(self, x, skip_feat):
         x = self.expand_channels(x)
