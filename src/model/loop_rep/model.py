@@ -107,22 +107,23 @@ class BottleneckLayer(nn.Module):
     def __init__(self, dim, num_hybrid_blocks=2):
         super().__init__()
 
-        self.norm_in = LayerNorm2d(dim)
-
-        self.gate_fusion = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1),
-            nn.Sigmoid()
-        )
-        self.feature_update = nn.Sequential(
+        self.condition_fusion = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1),
             nn.GELU(),
             RepConv3(dim, dim, groups=dim),
             nn.GELU()
         )
+        self.norm_in = LayerNorm2d(dim)
 
         self.blocks = nn.ModuleList([
             BottleneckBlock(dim) for _ in range(num_hybrid_blocks)
         ])
+
+        # GRU-Gating
+        self.gate_fusion = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 1),
+            nn.Sigmoid()
+        )
 
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -132,18 +133,23 @@ class BottleneckLayer(nn.Module):
         )
 
     def forward(self, x, x_orig):
+        state_old = x 
+        
         norm_x = self.norm_in(x)
         concat_feat = torch.cat([norm_x, x_orig], dim=1)
-        condition = self.condition_fusion(torch.cat([norm_x, x_orig], dim=1))
-        x = x + condition 
+        x = x + self.condition_fusion(concat_feat)
         
         for block in self.blocks:
             x = block(x)
             
-        gate_logits = self.gate(x)
+        # GRU-Gating
+        z = self.gate_fusion(torch.cat([state_old, x], dim=1))
+        x_final = (1 - z) * state_old + z * x
+            
+        gate_logits = self.gate(x_final)
         exit_prob = torch.sigmoid(gate_logits).view(-1)
 
-        return x, gate_logits, exit_prob
+        return x_final, gate_logits, exit_prob
 
 
 class AdaptiveLoopedBottleneck(nn.Module):
