@@ -106,14 +106,19 @@ class BottleneckBlock(nn.Module):
 class BottleneckLayer(nn.Module):
     def __init__(self, dim, num_hybrid_blocks=2):
         super().__init__()
-        
-        self.condition_fusion = nn.Sequential(
-            nn.Conv2d(dim * 2, dim * 2, 1),
+
+        self.norm_in = LayerNorm2d(dim)
+
+        self.gate_fusion = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 1),
+            nn.Sigmoid()
+        )
+        self.feature_update = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 1),
             nn.GELU(),
-            RepConv3(dim * 2, dim, groups=dim),
+            RepConv3(dim, dim, groups=dim),
             nn.GELU()
         )
-        self.norm_in = LayerNorm2d(dim)
 
         self.blocks = nn.ModuleList([
             BottleneckBlock(dim) for _ in range(num_hybrid_blocks)
@@ -128,6 +133,7 @@ class BottleneckLayer(nn.Module):
 
     def forward(self, x, x_orig):
         norm_x = self.norm_in(x)
+        concat_feat = torch.cat([norm_x, x_orig], dim=1)
         condition = self.condition_fusion(torch.cat([norm_x, x_orig], dim=1))
         x = x + condition 
         
@@ -146,6 +152,9 @@ class AdaptiveLoopedBottleneck(nn.Module):
         self.max_loops = max_loops
         self.layer = BottleneckLayer(dim)
 
+        self.step_embeddings = nn.Parameter(torch.zeros(max_loops, 1, dim, 1, 1))
+        nn.init.normal_(self.step_embeddings, std=0.02)
+
     def forward(self, x, halt_threshold=0.8, return_all=False):
         B = x.shape[0]
         device = x.device
@@ -159,8 +168,11 @@ class AdaptiveLoopedBottleneck(nn.Module):
 
             state = x
 
-            for _ in range(self.max_loops):
-                state, g_logits, lambda_t = self.layer(state, x_orig)
+            for t in range(self.max_loops):
+                state_with_step = state + self.step_embeddings[t]
+
+                state, g_logits, lambda_t = self.layer(state_with_step, x_orig)
+
                 states.append(state)
                 exit_probs.append(lambda_t)
                 gate_logits_list.append(g_logits)
@@ -192,7 +204,8 @@ class AdaptiveLoopedBottleneck(nn.Module):
             cumulative = torch.zeros(B, device=device)
 
             for t in range(self.max_loops):
-                state, _, lambda_t = self.layer(state, x_orig)
+                state_with_step = state + self.step_embeddings[t]
+                state, _, lambda_t = self.layer(state_with_step, x_orig)
                 survival = (1.0 - cumulative).clamp(min=1e-6)
                 cumulative = torch.clamp(cumulative + lambda_t * survival, min=0.0, max=1.0)
                 
