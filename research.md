@@ -54,3 +54,6 @@ DocPINN: A Neural PDE-Based Framework for Document Image Dewarping|Thêm physics
 -PreP-OCR:  -> image enhancement model học để tối ưu OCR, không phải PSNR.
             -> Stage 1 — Document Image Restoration -> Stage 2 — Post-OCR Correction: Dùng ByT5: ByT5 hoạt động byte-level, nên: xử lý lỗi ký tự tốt, không phụ thuộc tokenizer.
             -> Multi-directional patch processing
+
+
+  https://arxiv.org/pdf/1802.06955
