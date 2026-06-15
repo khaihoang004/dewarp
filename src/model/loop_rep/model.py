@@ -85,17 +85,17 @@ class BottleneckBlock(nn.Module):
         # Global (Attention)
         self.norm1 = LayerNorm2d(dim)
         self.attn = RestormerAttention(dim)
-        self.scale1 = LayerScale(dim, init_value=1e-2)
+        self.scale1 = LayerScale(dim, init_value=0.5)
         
         # Local (Convolution)
         self.norm2 = LayerNorm2d(dim)
         self.conv = RepConv3(dim, dim, groups=1, deploy=deploy)
-        self.scale2 = LayerScale(dim, init_value=1e-2)
+        self.scale2 = LayerScale(dim, init_value=0.5)
         
         # Channel (FFN)
         self.norm3 = LayerNorm2d(dim)
         self.ffn = SwiGLU_FFN(dim)
-        self.scale3 = LayerScale(dim, init_value=1e-2)
+        self.scale3 = LayerScale(dim, init_value=0.5)
         
     def forward(self, x):
         x = x + self.scale1(self.attn(self.norm1(x)))
@@ -104,52 +104,40 @@ class BottleneckBlock(nn.Module):
         return x
 
 class BottleneckLayer(nn.Module):
-    def __init__(self, dim, num_hybrid_blocks=2):
+    def __init__(self, dim, num_blocks=1):
         super().__init__()
-
-        self.condition_fusion = nn.Sequential(
+        self.blocks = nn.ModuleList([BottleneckBlock(dim) for _ in range(num_blocks)])
+        
+        self.fusion = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1),
             nn.GELU(),
-            RepConv3(dim, dim, groups=dim),
-            nn.GELU()
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+            nn.GELU(),
         )
-        self.norm_in = LayerNorm2d(dim)
-
-        self.blocks = nn.ModuleList([
-            BottleneckBlock(dim) for _ in range(num_hybrid_blocks)
-        ])
-
-        # GRU-Gating
-        self.gate_fusion = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1),
-            nn.Sigmoid()
-        )
-
-        self.gate = nn.Sequential(
+        
+        # Entropy-based exit head
+        self.exit_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, dim // 4, kernel_size=1),
+            nn.Conv2d(dim, dim//4, 1),
             nn.GELU(),
-            nn.Conv2d(dim // 4, 1, kernel_size=1)
+            nn.Conv2d(dim//4, 1, 1),
         )
 
-    def forward(self, x, x_orig):
-        state_old = x 
-        
-        norm_x = self.norm_in(x)
-        concat_feat = torch.cat([norm_x, x_orig], dim=1)
-        x = x + self.condition_fusion(concat_feat)
-        
+    def forward(self, x, x_orig, step_embed=None):
+        concat = torch.cat([x, x_orig], dim=1)
+        fused = self.fusion(concat)
+        if step_embed is not None:
+            fused = fused + step_embed
+        x = x + fused
+
         for block in self.blocks:
             x = block(x)
-            
-        # GRU-Gating
-        z = self.gate_fusion(torch.cat([state_old, x], dim=1))
-        x_final = (1 - z) * state_old + z * x
-            
-        gate_logits = self.gate(x_final)
-        exit_prob = torch.sigmoid(gate_logits).view(-1)
 
-        return x_final, gate_logits, exit_prob
+        # Exit logit
+        exit_logit = self.exit_head(x).view(-1)
+        exit_prob = torch.sigmoid(exit_logit)
+
+        return x, exit_logit, exit_prob
 
 
 class AdaptiveLoopedBottleneck(nn.Module):
@@ -160,34 +148,34 @@ class AdaptiveLoopedBottleneck(nn.Module):
 
         self.step_embeddings = nn.Parameter(torch.zeros(max_loops, 1, dim, 1, 1))
         nn.init.normal_(self.step_embeddings, std=0.02)
-
-    def forward(self, x, halt_threshold=0.8, return_all=False):
+    
+    def forward(self, x, halt_threshold=0.85, return_all=False):
         B = x.shape[0]
         device = x.device
-
-        x_orig = x.detach() if not self.training else x
+        x_orig = x.detach() if not self.training else x.clone()
 
         if self.training or return_all:
             states = []
-            exit_probs = []          # list of (B,)
-            gate_logits_list = []
+            exit_probs_list = []
+            logits_list = []
 
             state = x
-
             for t in range(self.max_loops):
-                state_with_step = state + self.step_embeddings[t]
+                step_embed = self.step_embeddings[t]
+                state_with_step = state + step_embed
 
-                state, g_logits, lambda_t = self.layer(state_with_step, x_orig)
+                # Forward 1 step
+                state, g_logit, e_prob = self.layer(state_with_step, x_orig, step_embed)
 
                 states.append(state)
-                exit_probs.append(lambda_t)
-                gate_logits_list.append(g_logits)
-            
-            exit_probs = torch.stack(exit_probs, dim=0)        # (T, B)
-            gate_logits = torch.stack(gate_logits_list, dim=0)
+                exit_probs_list.append(e_prob)
+                logits_list.append(g_logit)
 
-            survival = torch.ones(B, device=device)            # S_0 = 1
-            halting_weights = torch.zeros_like(exit_probs)
+            exit_probs = torch.stack(exit_probs_list, dim=0)      # (T, B)
+            gate_logits = torch.stack(logits_list, dim=0)         # (T, B)
+
+            survival = torch.ones(B, device=device)
+            halting_weights = torch.zeros_like(exit_probs)        # (T, B)
 
             for t in range(self.max_loops):
                 if t < self.max_loops - 1:
@@ -200,23 +188,27 @@ class AdaptiveLoopedBottleneck(nn.Module):
             final_state = torch.zeros_like(states[0])
             for t in range(self.max_loops):
                 w = halting_weights[t].view(B, 1, 1, 1)
-                final_state += w * states[t]
+                final_state = final_state + w * states[t]
 
-            return final_state, states, halting_weights, gate_logits, exit_probs
+            if return_all:
+                return final_state, states, halting_weights, gate_logits, exit_probs
+            return final_state
 
         else:
-            # Inference
             state = x
             cumulative = torch.zeros(B, device=device)
 
             for t in range(self.max_loops):
-                state_with_step = state + self.step_embeddings[t]
-                state, _, lambda_t = self.layer(state_with_step, x_orig)
+                step_embed = self.step_embeddings[t]
+                state_with_step = state + step_embed
+
+                state, _, lambda_t = self.layer(state_with_step, x_orig, step_embed)
+
                 survival = (1.0 - cumulative).clamp(min=1e-6)
                 cumulative = torch.clamp(cumulative + lambda_t * survival, min=0.0, max=1.0)
-                
+
                 if (cumulative >= halt_threshold).all():
-                    return state
+                    break
 
             return state
 
