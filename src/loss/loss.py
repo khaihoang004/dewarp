@@ -161,7 +161,7 @@ class Stage1Loss(nn.Module):
             rec_t, _, _, _, _, _ = self.reconstruction_loss(pred_t, target, current_epoch)
             rec_losses.append(rec_t)
 
-        rec_losses = torch.stack(rec_losses, dim=0)   # (T, B)
+        rec_losses = torch.stack(rec_losses, dim=0)      # (T, B)
 
         if halting_weights is not None:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
@@ -174,7 +174,7 @@ class Stage1Loss(nn.Module):
         if T > 1 and self.consistency_weight > 0:
             for t in range(1, T):
                 consistency_loss += F.mse_loss(intermediate_preds[t], intermediate_preds[t-1].detach())
-            consistency_loss /= (T - 1)
+            consistency_loss = consistency_loss / (T - 1)
 
         # 3. Progressive Distillation
         ilsd_loss = 0.0
@@ -188,9 +188,9 @@ class Stage1Loss(nn.Module):
                 high_d = F.l1_loss(sh, th)
                 weight = (t + 1) / T
                 ilsd_loss += weight * (spatial_d + self.freq_distill_weight * high_d)
-            ilsd_loss /= (T - 1)
+            ilsd_loss = ilsd_loss / (T - 1)
 
-        # 4. Entropy
+        # 4. Entropy Regularization
         entropy_loss = 0.0
         if exit_probs is not None and self.entropy_weight > 0:
             p_mean = exit_probs.mean(dim=0)
@@ -205,15 +205,16 @@ class Stage1Loss(nn.Module):
                 loss_pos = adv * (-torch.log(1 - p_t)) * (adv > 0).float()
                 loss_neg = (-adv) * (-torch.log(p_t)) * (adv <= 0).float()
                 rltt_policy_loss += (loss_pos + loss_neg).mean()
-            rltt_policy_loss /= (T - 1)
+            rltt_policy_loss = rltt_policy_loss / (T - 1)
 
-        # 6. KL
+        # 6. KL Regularization
         kl_loss = 0.0
         if halting_weights is not None and self.kl_weight > 0:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
             uniform_prior = torch.ones_like(q) / T
             kl_loss = F.kl_div(q.log(), uniform_prior, reduction='batchmean')
 
+        # === Tổng loss ===
         total_loss = (
             self.rltt_trajectory_weight * weighted_rec +
             self.consistency_weight * consistency_loss +
@@ -226,11 +227,11 @@ class Stage1Loss(nn.Module):
         loss_dict = {
             "loss/total": total_loss.item(),
             "loss/rec_weighted": weighted_rec.item(),
-            "loss/consistency": consistency_loss.item(),
-            "loss/ilsd": ilsd_loss.item(),
-            "loss/entropy": entropy_loss.item(),
-            "loss/rltt_policy": rltt_policy_loss.item(),
-            "loss/kl": kl_loss.item(),
+            "loss/consistency": float(consistency_loss),
+            "loss/ilsd": float(ilsd_loss),
+            "loss/entropy": float(entropy_loss),
+            "loss/rltt_policy": float(rltt_policy_loss),
+            "loss/kl": float(kl_loss),
         }
 
         return total_loss, loss_dict
