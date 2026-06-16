@@ -83,47 +83,30 @@ class FrequencySeparator(nn.Module):
 class Stage1Loss(nn.Module):
     def __init__(
         self,
-        rltt_trajectory_weight=1.0,
-        consistency_weight=0.12,
-        distillation_weight=0.25,
-        freq_distill_weight=0.18,
-        entropy_weight=0.035,
-        kl_weight=0.04,
-        rltt_policy_weight=0.06,
-        low_weight=0.55,
+        # Core reconstruction
+        trajectory_weight=1.0,
+        low_weight=0.6,
         high_weight=1.45,
-        w_freq=1.0,
-        w_perceptual=0.03,
-        w_ssim=0.07,
-        ssim_warmup_epochs=6,
+        perceptual_weight=0.035,
+        
+        # Regularization
+        refine_weight=0.10,      # Đảm bảo loop cải thiện
+        kl_weight=0.06,          # Giữ KL để chia đều halting weights
     ):
         super().__init__()
-        self.rltt_trajectory_weight = rltt_trajectory_weight
-        self.consistency_weight = consistency_weight
-        self.distillation_weight = distillation_weight
-        self.freq_distill_weight = freq_distill_weight
-        self.entropy_weight = entropy_weight
-        self.kl_weight = kl_weight
-        self.rltt_policy_weight = rltt_policy_weight
-
+        self.trajectory_weight = trajectory_weight
         self.low_weight = low_weight
         self.high_weight = high_weight
-        self.w_freq = w_freq
-        self.w_perceptual = w_perceptual
-        self.w_ssim = w_ssim
-        self.ssim_warmup_epochs = ssim_warmup_epochs
+        self.perceptual_weight = perceptual_weight
+        self.refine_weight = refine_weight
+        self.kl_weight = kl_weight
 
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FrequencySeparator(kernel_size=5)
         self.vgg_loss = VGGPerceptualLoss()
 
-    def get_ssim_weight(self, current_epoch):
-        if self.ssim_warmup_epochs <= 0:
-            return self.w_ssim
-        progress = min(current_epoch / self.ssim_warmup_epochs, 1.0)
-        return progress * self.w_ssim
-
-    def reconstruction_loss(self, pred, target, current_epoch=0):
+    def reconstruction_loss(self, pred, target):
+        """Charbonnier + Frequency + VGG"""
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
         
@@ -134,34 +117,21 @@ class Stage1Loss(nn.Module):
 
         perceptual = self.vgg_loss(pred, target)
 
-        pred_safe = torch.clamp(pred, 0., 1.)
-        target_safe = torch.clamp(target, 0., 1.)
-        ssim_loss = 1.0 - ssim(pred_safe, target_safe, data_range=1.0, size_average=False)
-        if ssim_loss.ndim > 1:
-            ssim_loss = ssim_loss.mean(dim=tuple(range(1, ssim_loss.ndim)))
-
-        current_ssim_w = self.get_ssim_weight(current_epoch)
-
-        combined = (
-            self.w_freq * freq_loss +
-            self.w_perceptual * perceptual +
-            current_ssim_w * ssim_loss
-        )
-        
-        return combined, freq_loss, low_loss, high_loss, perceptual, ssim_loss
+        combined = freq_loss + self.perceptual_weight * perceptual
+        return combined, freq_loss, perceptual
 
     def forward(self, target, final_pred, intermediate_preds, 
-                halting_weights=None, exit_probs=None, current_epoch=0, **kwargs):
+                halting_weights=None, **kwargs):
         
         T = len(intermediate_preds)
 
-        # 1. Trajectory Weighted Reconstruction
+        # 1. Trajectory Weighted Reconstruction (Charbonnier + Freq + VGG)
         rec_losses = []
         for pred_t in intermediate_preds:
-            rec_t, _, _, _, _, _ = self.reconstruction_loss(pred_t, target, current_epoch)
+            rec_t, _, _ = self.reconstruction_loss(pred_t, target)
             rec_losses.append(rec_t)
 
-        rec_losses = torch.stack(rec_losses, dim=0)      # (T, B)
+        rec_losses = torch.stack(rec_losses, dim=0)   # (T, B)
 
         if halting_weights is not None:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
@@ -169,45 +139,15 @@ class Stage1Loss(nn.Module):
         else:
             weighted_rec = rec_losses.mean(dim=0).mean()
 
-        # 2. Consistency Loss
-        consistency_loss = 0.0
-        if T > 1 and self.consistency_weight > 0:
+        # 2. Refine Loss - Đảm bảo loop sau cải thiện
+        refine_loss = 0.0
+        if T > 1 and self.refine_weight > 0:
             for t in range(1, T):
-                consistency_loss += F.mse_loss(intermediate_preds[t], intermediate_preds[t-1].detach())
-            consistency_loss = consistency_loss / (T - 1)
+                improvement = rec_losses[t-1] - rec_losses[t]
+                refine_loss += F.relu(improvement).mean()
+            refine_loss = refine_loss / (T - 1)
 
-        # 3. Progressive Distillation
-        ilsd_loss = 0.0
-        if T > 1 and self.distillation_weight > 0:
-            for t in range(T - 1):
-                stu = intermediate_preds[t]
-                tea = intermediate_preds[t + 1].detach()
-                spatial_d = F.l1_loss(stu, tea)
-                _, sh = self.freq_separator(stu)
-                _, th = self.freq_separator(tea)
-                high_d = F.l1_loss(sh, th)
-                weight = (t + 1) / T
-                ilsd_loss += weight * (spatial_d + self.freq_distill_weight * high_d)
-            ilsd_loss = ilsd_loss / (T - 1)
-
-        # 4. Entropy Regularization
-        entropy_loss = 0.0
-        if exit_probs is not None and self.entropy_weight > 0:
-            p_mean = exit_probs.mean(dim=0)
-            entropy_loss = - (p_mean * torch.log(p_mean + 1e-8)).mean()
-
-        # 5. RLTT Policy
-        rltt_policy_loss = 0.0
-        if exit_probs is not None and self.rltt_policy_weight > 0 and T > 1:
-            for t in range(1, T):
-                adv = (rec_losses[t-1] - rec_losses[t]).detach()
-                p_t = exit_probs[t].clamp(1e-6, 1.0 - 1e-6)
-                loss_pos = adv * (-torch.log(1 - p_t)) * (adv > 0).float()
-                loss_neg = (-adv) * (-torch.log(p_t)) * (adv <= 0).float()
-                rltt_policy_loss += (loss_pos + loss_neg).mean()
-            rltt_policy_loss = rltt_policy_loss / (T - 1)
-
-        # 6. KL Regularization
+        # 3. KL Loss (giữ lại để model chia đều weight)
         kl_loss = 0.0
         if halting_weights is not None and self.kl_weight > 0:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
@@ -216,21 +156,15 @@ class Stage1Loss(nn.Module):
 
         # === Tổng loss ===
         total_loss = (
-            self.rltt_trajectory_weight * weighted_rec +
-            self.consistency_weight * consistency_loss +
-            self.distillation_weight * ilsd_loss +
-            self.entropy_weight * entropy_loss +
-            self.rltt_policy_weight * rltt_policy_loss +
+            self.trajectory_weight * weighted_rec +
+            self.refine_weight * refine_loss +
             self.kl_weight * kl_loss
         )
 
         loss_dict = {
             "loss/total": total_loss.item(),
             "loss/rec_weighted": weighted_rec.item(),
-            "loss/consistency": float(consistency_loss),
-            "loss/ilsd": float(ilsd_loss),
-            "loss/entropy": float(entropy_loss),
-            "loss/rltt_policy": float(rltt_policy_loss),
+            "loss/refine": float(refine_loss),
             "loss/kl": float(kl_loss),
         }
 
