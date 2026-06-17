@@ -19,6 +19,7 @@ class CharbonnierLoss(nn.Module):
         elif reduction == 'none':
             return torch.mean(loss, dim=[1, 2, 3])
 
+
 class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -75,8 +76,37 @@ class FrequencySeparator(nn.Module):
         return gauss2d
 
     def forward(self, x):
-        low_freq = F.conv2d(x, self.gaussian_kernel, padding=self.padding, groups=self.channels)
+        x_padded = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        low_freq = F.conv2d(x_padded, self.gaussian_kernel, padding=0, groups=self.channels)
         high_freq = x - low_freq
+        return low_freq, high_freq
+
+
+class FFTSeparator(nn.Module):
+    def __init__(self, cutoff_freq=20):
+        super().__init__()
+        self.cutoff_freq = cutoff_freq
+
+    def forward(self, x):
+        _, _, H, W = x.shape
+        
+        fft_x = torch.fft.fft2(x)
+        fft_x_shifted = torch.fft.fftshift(fft_x, dim=(-2, -1))
+        
+        Y, X = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+        center_y, center_x = H // 2, W // 2
+        dist_from_center = torch.sqrt((Y - center_y)**2 + (X - center_x)**2).to(x.device)
+        
+        mask = torch.exp(-(dist_from_center**2) / (2 * (self.cutoff_freq**2)))
+        mask = mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+        
+        low_fft = fft_x_shifted * mask
+        
+        low_fft_unshifted = torch.fft.ifftshift(low_fft, dim=(-2, -1))
+        low_freq = torch.fft.ifft2(low_fft_unshifted).real
+        
+        high_freq = x - low_freq
+        
         return low_freq, high_freq
 
 
@@ -102,7 +132,7 @@ class Stage1Loss(nn.Module):
         self.kl_weight = kl_weight
 
         self.charbonnier = CharbonnierLoss()
-        self.freq_separator = FrequencySeparator(kernel_size=5)
+        self.freq_separator = FFTSeparator(cutoff_freq=25)
         self.vgg_loss = VGGPerceptualLoss()
 
     def reconstruction_loss(self, pred, target):
@@ -169,8 +199,7 @@ class Stage1Loss(nn.Module):
         }
 
         return total_loss, loss_dict
-       
-
+        
 
 class Stage2Loss(nn.Module):
     def __init__(self, rltt_weight=0.1, ponder_weight=0.015, alpha=0.7):
