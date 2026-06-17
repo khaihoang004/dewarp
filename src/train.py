@@ -247,11 +247,30 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
     scaler = GradScaler(enabled=cfg.use_amp)
     best_psnr = 0.0
     global_step = 0
+    start_epoch = 0
+
+    # 1. RELOAD CHECKPOINT
+    checkpoint_path = getattr(cfg, "resume_checkpoint", f"latest_checkpoint_stage{stage}.pth")
+    if os.path.exists(checkpoint_path):
+        print(f"Load checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        global_step = checkpoint['global_step']
+        best_psnr = checkpoint.get('best_psnr', 0.0)
+        
+        print(f"Continue training from epoch {start_epoch}.")
 
     accumulation_steps = getattr(cfg, "accumulation_steps", 4)
     max_steps_per_epoch = getattr(cfg, "max_steps_per_epoch", 500)
 
-    for epoch in range(cfg.epochs):
+    # 2. TRAIN
+    for epoch in range(start_epoch, cfg.epochs):
         train_loss, global_step = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -279,15 +298,30 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         }, step=global_step)
 
         current_psnr = val_metrics["val/psnr"]
+        
+        # 3. SAVE BEST MODEL
         if current_psnr > best_psnr:
             best_psnr = current_psnr
-            torch.save(model.state_dict(), f"best_model_stage{stage}.pth")
-            print(f"→ Saved best model at epoch {epoch} (PSNR: {best_psnr:.3f})")
+            best_model_name = f"best_model_stage{stage}_epoch{epoch}.pth"
+            torch.save(model.state_dict(), best_model_name)
+            print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f})")
+
+        # 4. SAVE CHECKPOINT EACH EPOCH
+        checkpoint_state = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'best_psnr': best_psnr
+        }
+        torch.save(checkpoint_state, f"latest_checkpoint_stage{stage}.pth")
 
         print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | SSIM: {val_metrics['val/ssim']:.4f}")
-        
+
         if (epoch + 1) >= 5 and current_psnr < 15.0:
-            print(f"PSNR = ({current_psnr:.3f}) < 15, model fail!")
+            print(f"Stop! At {epoch}: PSNR ({current_psnr:.3f}) < 15.0.")
             break
 
     print("Training completed!")
