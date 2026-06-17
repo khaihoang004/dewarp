@@ -285,6 +285,10 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
             print(f"→ Saved best model at epoch {epoch} (PSNR: {best_psnr:.3f})")
 
         print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | SSIM: {val_metrics['val/ssim']:.4f}")
+        
+        if (epoch + 1) >= 5 and current_psnr < 15.0:
+            print(f"PSNR = ({current_psnr:.3f}) < 15, model fail!")
+            break
 
     print("Training completed!")
     return model
