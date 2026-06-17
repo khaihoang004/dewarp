@@ -148,7 +148,8 @@ class Stage1Loss(nn.Module):
         perceptual = self.vgg_loss(pred, target)
 
         combined = freq_loss + self.perceptual_weight * perceptual
-        return combined, freq_loss, perceptual
+
+        return combined, freq_loss, perceptual, low_loss, high_loss
 
     def forward(self, target, final_pred, intermediate_preds, 
                 halting_weights=None, **kwargs):
@@ -157,17 +158,28 @@ class Stage1Loss(nn.Module):
 
         # 1. Trajectory Weighted Reconstruction (Charbonnier + Freq + VGG)
         rec_losses = []
+        low_losses = []
+        high_losses = []
+        
         for pred_t in intermediate_preds:
-            rec_t, _, _ = self.reconstruction_loss(pred_t, target)
+            rec_t, _, _, low_t, high_t = self.reconstruction_loss(pred_t, target)
             rec_losses.append(rec_t)
+            low_losses.append(low_t)
+            high_losses.append(high_t)
 
-        rec_losses = torch.stack(rec_losses, dim=0)   # (T, B)
+        rec_losses = torch.stack(rec_losses, dim=0)   
+        low_losses = torch.stack(low_losses, dim=0)
+        high_losses = torch.stack(high_losses, dim=0)
 
         if halting_weights is not None:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
             weighted_rec = (q * rec_losses).sum(dim=0).mean()
+            weighted_low = (q * low_losses).sum(dim=0).mean()
+            weighted_high = (q * high_losses).sum(dim=0).mean()
         else:
             weighted_rec = rec_losses.mean(dim=0).mean()
+            weighted_low = low_losses.mean(dim=0).mean()
+            weighted_high = high_losses.mean(dim=0).mean()
 
         # 2. Refine Loss - Đảm bảo loop sau cải thiện
         refine_loss = 0.0
@@ -194,12 +206,14 @@ class Stage1Loss(nn.Module):
         loss_dict = {
             "loss/total": total_loss.item(),
             "loss/rec_weighted": weighted_rec.item(),
+            "loss/freq_low": weighted_low.item(),
+            "loss/freq_high": weighted_high.item(),
             "loss/refine": float(refine_loss),
             "loss/kl": float(kl_loss),
         }
 
         return total_loss, loss_dict
-        
+
 
 class Stage2Loss(nn.Module):
     def __init__(self, rltt_weight=0.1, ponder_weight=0.015, alpha=0.7):
