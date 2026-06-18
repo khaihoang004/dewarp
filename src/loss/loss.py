@@ -140,16 +140,12 @@ class FFTSeparator(nn.Module):
 class Stage1Loss(nn.Module):
     def __init__(
         self,
-        # Core reconstruction
         trajectory_weight=1.0,
         low_weight=0.6,
         high_weight=1.45,
         perceptual_weight=0.035,
-
-        color_weight=0.85,
+        color_weight=0.95,
         color_low_freq_weight=1.8,
-        
-        # Regularization
         refine_weight=0.10,
         kl_weight=0.06,
     ):
@@ -177,12 +173,9 @@ class Stage1Loss(nn.Module):
         
         freq_loss = self.low_weight * low_loss + self.high_weight * high_loss
         perceptual = self.vgg_loss(pred, target)
-        
         color_loss = self.color_cosine_loss(pred, target)
 
-        combined = (freq_loss + 
-                   self.perceptual_weight * perceptual + 
-                   self.color_weight * color_loss)
+        combined = freq_loss + self.perceptual_weight * perceptual + self.color_weight * color_loss
 
         return combined, freq_loss, perceptual, low_loss, high_loss, color_loss
 
@@ -190,6 +183,7 @@ class Stage1Loss(nn.Module):
                 halting_weights=None, **kwargs):
         
         T = len(intermediate_preds)
+        device = target.device
 
         rec_losses = []
         low_losses = []
@@ -197,27 +191,31 @@ class Stage1Loss(nn.Module):
         color_losses = []
 
         for pred_t in intermediate_preds:
-            rec_t, _, _, low_t, high_t, color_t = self.reconstruction_loss(pred_t, target)
+            rec_t, freq_t, perc_t, low_t, high_t, color_t = self.reconstruction_loss(pred_t, target)
             rec_losses.append(rec_t)
             low_losses.append(low_t)
             high_losses.append(high_t)
             color_losses.append(color_t)
 
-        rec_losses = torch.stack(rec_losses, dim=0)   
-        low_losses = torch.stack(low_losses, dim=0)
-        high_losses = torch.stack(high_losses, dim=0)
+        rec_losses   = torch.stack(rec_losses, dim=0)      # [T, B, ...]
+        low_losses   = torch.stack(low_losses, dim=0)
+        high_losses  = torch.stack(high_losses, dim=0)
         color_losses = torch.stack(color_losses, dim=0)
 
         if halting_weights is not None:
-            q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
-            weighted_rec = (q * rec_losses).sum(dim=0).mean()
-            weighted_low = (q * low_losses).sum(dim=0).mean()
-            weighted_high = (q * high_losses).sum(dim=0).mean()
-            weighted_color = (q * color_losses).sum(dim=0).mean()
+            if halting_weights.dim() == 2:  # [T, B]
+                q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
+            else:
+                q = halting_weights
+
+            weighted_rec   = (q.unsqueeze(-1) * rec_losses).sum(dim=0).mean()
+            weighted_low   = (q.unsqueeze(-1) * low_losses).sum(dim=0).mean()
+            weighted_high  = (q.unsqueeze(-1) * high_losses).sum(dim=0).mean()
+            weighted_color = (q.unsqueeze(-1) * color_losses).sum(dim=0).mean()
         else:
-            weighted_rec = rec_losses.mean(dim=0).mean()
-            weighted_low = low_losses.mean(dim=0).mean()
-            weighted_high = high_losses.mean(dim=0).mean()
+            weighted_rec   = rec_losses.mean(dim=0).mean()
+            weighted_low   = low_losses.mean(dim=0).mean()
+            weighted_high  = high_losses.mean(dim=0).mean()
             weighted_color = color_losses.mean(dim=0).mean()
 
         refine_loss = 0.0
@@ -233,7 +231,6 @@ class Stage1Loss(nn.Module):
             uniform_prior = torch.ones_like(q) / T
             kl_loss = F.kl_div(q.log(), uniform_prior, reduction='batchmean')
 
-        # === Tổng loss ===
         total_loss = (
             self.trajectory_weight * weighted_rec +
             self.color_weight * weighted_color +
