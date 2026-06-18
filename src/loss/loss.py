@@ -61,7 +61,7 @@ class ColorCosineLoss(nn.Module):
         super().__init__()
         self.weight_low_freq = weight_low_freq
         self.eps = eps
-        self.freq_sep = FFTSeparator(cutoff_freq=20)  # reuse từ code của bạn
+        self.freq_sep = FFTSeparator(cutoff_freq=20)
 
     def forward(self, pred, target):
         b, c, h, w = pred.shape
@@ -71,7 +71,6 @@ class ColorCosineLoss(nn.Module):
         global_cos = F.cosine_similarity(pred_flat + self.eps, target_flat + self.eps, dim=1)
         global_loss = 1.0 - global_cos.mean()
 
-        # 2. Low-frequency Color
         pred_low, _ = self.freq_sep(pred)
         target_low, _ = self.freq_sep(target)
         
@@ -164,7 +163,6 @@ class Stage1Loss(nn.Module):
         self.color_cosine_loss = ColorCosineLoss(weight_low_freq=color_low_freq_weight)
 
     def reconstruction_loss(self, pred, target):
-        """Charbonnier + Frequency + VGG + Color Cosine"""
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
         
@@ -177,13 +175,10 @@ class Stage1Loss(nn.Module):
 
         combined = freq_loss + self.perceptual_weight * perceptual + self.color_weight * color_loss
 
-        return combined, freq_loss, perceptual, low_loss, high_loss, color_loss
+        return combined, low_loss, high_loss, color_loss
 
-    def forward(self, target, final_pred, intermediate_preds, 
-                halting_weights=None, **kwargs):
-        
+    def forward(self, target, final_pred, intermediate_preds, halting_weights=None, **kwargs):
         T = len(intermediate_preds)
-        device = target.device
 
         rec_losses = []
         low_losses = []
@@ -191,33 +186,37 @@ class Stage1Loss(nn.Module):
         color_losses = []
 
         for pred_t in intermediate_preds:
-            rec_t, freq_t, perc_t, low_t, high_t, color_t = self.reconstruction_loss(pred_t, target)
+            rec_t, low_t, high_t, color_t = self.reconstruction_loss(pred_t, target)
             rec_losses.append(rec_t)
             low_losses.append(low_t)
             high_losses.append(high_t)
             color_losses.append(color_t)
 
-        rec_losses   = torch.stack(rec_losses, dim=0)      # [T, B, ...]
+        rec_losses   = torch.stack(rec_losses, dim=0)   # [T, B, ...]
         low_losses   = torch.stack(low_losses, dim=0)
         high_losses  = torch.stack(high_losses, dim=0)
         color_losses = torch.stack(color_losses, dim=0)
 
+        # === Weighted Loss (phần hay lỗi) ===
         if halting_weights is not None:
-            if halting_weights.dim() == 2:  # [T, B]
-                q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
+            # halting_weights thường có shape [T, B]
+            if halting_weights.dim() == 2:
+                q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)  # [T, B]
+                q = q.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)   # broadcast cho [T, B, 1,1,1]
             else:
                 q = halting_weights
 
-            weighted_rec   = (q.unsqueeze(-1) * rec_losses).sum(dim=0).mean()
-            weighted_low   = (q.unsqueeze(-1) * low_losses).sum(dim=0).mean()
-            weighted_high  = (q.unsqueeze(-1) * high_losses).sum(dim=0).mean()
-            weighted_color = (q.unsqueeze(-1) * color_losses).sum(dim=0).mean()
+            weighted_rec   = (q * rec_losses).sum(dim=0).mean()
+            weighted_low   = (q * low_losses).sum(dim=0).mean()
+            weighted_high  = (q * high_losses).sum(dim=0).mean()
+            weighted_color = (q * color_losses).sum(dim=0).mean()
         else:
-            weighted_rec   = rec_losses.mean(dim=0).mean()
-            weighted_low   = low_losses.mean(dim=0).mean()
-            weighted_high  = high_losses.mean(dim=0).mean()
-            weighted_color = color_losses.mean(dim=0).mean()
+            weighted_rec   = rec_losses.mean()
+            weighted_low   = low_losses.mean()
+            weighted_high  = high_losses.mean()
+            weighted_color = color_losses.mean()
 
+        # Refine & KL Loss (giữ nguyên)
         refine_loss = 0.0
         if T > 1 and self.refine_weight > 0:
             for t in range(1, T):
