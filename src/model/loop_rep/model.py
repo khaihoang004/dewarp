@@ -6,7 +6,7 @@ from .repconv import RepConv3, RepConv7
 from .attention import DocumentAttn, RestormerAttention
 
 
-class RMSNorm(nn.Module):
+class RMSNorm2d(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -83,17 +83,17 @@ class BottleneckBlock(nn.Module):
     def __init__(self, dim, deploy=False):
         super().__init__()
         # Global (Attention)
-        self.norm1 = LayerNorm2d(dim)
+        self.norm1 = RMSNorm2d(dim)
         self.attn = RestormerAttention(dim)
         self.scale1 = LayerScale(dim, init_value=0.5)
         
         # Local (Convolution)
-        self.norm2 = LayerNorm2d(dim)
+        self.norm2 = RMSNorm2d(dim)
         self.conv = RepConv3(dim, dim, groups=1, deploy=deploy)
         self.scale2 = LayerScale(dim, init_value=0.5)
         
         # Channel (FFN)
-        self.norm3 = LayerNorm2d(dim)
+        self.norm3 = RMSNorm2d(dim)
         self.ffn = SwiGLU_FFN(dim)
         self.scale3 = LayerScale(dim, init_value=0.5)
         
@@ -233,12 +233,12 @@ class EncoderStage(nn.Module):
             ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
             for _ in range(num_blocks)
         ])
-        self.norm_feat = LayerNorm2d(out_channels)
+        self.norm_feat = RMSNorm2d(out_channels)
 
         self.down = nn.PixelUnshuffle(downscale_factor=2)
         self.channel_compress = nn.Conv2d(out_channels * 4, out_channels, kernel_size=1, bias=False)
         self.act_down = nn.GELU()
-        self.norm_down = LayerNorm2d(out_channels)
+        self.norm_down = RMSNorm2d(out_channels)
 
     def forward(self, x):
         feat = self.act(self.conv(x))
