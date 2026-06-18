@@ -56,6 +56,33 @@ class VGGPerceptualLoss(nn.Module):
 
         return loss
 
+class ColorCosineLoss(nn.Module):
+    def __init__(self, weight_low_freq=1.5, eps=1e-6):
+        super().__init__()
+        self.weight_low_freq = weight_low_freq
+        self.eps = eps
+        self.freq_sep = FFTSeparator(cutoff_freq=20)  # reuse từ code của bạn
+
+    def forward(self, pred, target):
+        b, c, h, w = pred.shape
+        pred_flat = pred.view(b, c, -1)
+        target_flat = target.view(b, c, -1)
+        
+        global_cos = F.cosine_similarity(pred_flat + self.eps, target_flat + self.eps, dim=1)
+        global_loss = 1.0 - global_cos.mean()
+
+        # 2. Low-frequency Color
+        pred_low, _ = self.freq_sep(pred)
+        target_low, _ = self.freq_sep(target)
+        
+        pred_low_flat = pred_low.view(b, c, -1)
+        target_low_flat = target_low.view(b, c, -1)
+        
+        low_cos = F.cosine_similarity(pred_low_flat + self.eps, target_low_flat + self.eps, dim=1)
+        low_loss = 1.0 - low_cos.mean()
+
+        total_loss = global_loss + self.weight_low_freq * low_loss
+        return total_loss
 
 class FrequencySeparator(nn.Module):
     def __init__(self, kernel_size=5, sigma=1.0, channels=3):
@@ -118,25 +145,30 @@ class Stage1Loss(nn.Module):
         low_weight=0.6,
         high_weight=1.45,
         perceptual_weight=0.035,
+
+        color_weight=0.85,
+        color_low_freq_weight=1.8,
         
         # Regularization
-        refine_weight=0.10,      # Đảm bảo loop cải thiện
-        kl_weight=0.06,          # Giữ KL để chia đều halting weights
+        refine_weight=0.10,
+        kl_weight=0.06,
     ):
         super().__init__()
         self.trajectory_weight = trajectory_weight
         self.low_weight = low_weight
         self.high_weight = high_weight
         self.perceptual_weight = perceptual_weight
+        self.color_weight = color_weight
         self.refine_weight = refine_weight
         self.kl_weight = kl_weight
 
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FFTSeparator(cutoff_freq=25)
         self.vgg_loss = VGGPerceptualLoss()
+        self.color_cosine_loss = ColorCosineLoss(weight_low_freq=color_low_freq_weight)
 
     def reconstruction_loss(self, pred, target):
-        """Charbonnier + Frequency + VGG"""
+        """Charbonnier + Frequency + VGG + Color Cosine"""
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
         
@@ -144,44 +176,50 @@ class Stage1Loss(nn.Module):
         high_loss = self.charbonnier(pred_high, target_high, reduction='none')
         
         freq_loss = self.low_weight * low_loss + self.high_weight * high_loss
-
         perceptual = self.vgg_loss(pred, target)
+        
+        color_loss = self.color_cosine_loss(pred, target)
 
-        combined = freq_loss + self.perceptual_weight * perceptual
+        combined = (freq_loss + 
+                   self.perceptual_weight * perceptual + 
+                   self.color_weight * color_loss)
 
-        return combined, freq_loss, perceptual, low_loss, high_loss
+        return combined, freq_loss, perceptual, low_loss, high_loss, color_loss
 
     def forward(self, target, final_pred, intermediate_preds, 
                 halting_weights=None, **kwargs):
         
         T = len(intermediate_preds)
 
-        # 1. Trajectory Weighted Reconstruction (Charbonnier + Freq + VGG)
         rec_losses = []
         low_losses = []
         high_losses = []
-        
+        color_losses = []
+
         for pred_t in intermediate_preds:
-            rec_t, _, _, low_t, high_t = self.reconstruction_loss(pred_t, target)
+            rec_t, _, _, low_t, high_t, color_t = self.reconstruction_loss(pred_t, target)
             rec_losses.append(rec_t)
             low_losses.append(low_t)
             high_losses.append(high_t)
+            color_losses.append(color_t)
 
         rec_losses = torch.stack(rec_losses, dim=0)   
         low_losses = torch.stack(low_losses, dim=0)
         high_losses = torch.stack(high_losses, dim=0)
+        color_losses = torch.stack(color_losses, dim=0)
 
         if halting_weights is not None:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
             weighted_rec = (q * rec_losses).sum(dim=0).mean()
             weighted_low = (q * low_losses).sum(dim=0).mean()
             weighted_high = (q * high_losses).sum(dim=0).mean()
+            weighted_color = (q * color_losses).sum(dim=0).mean()
         else:
             weighted_rec = rec_losses.mean(dim=0).mean()
             weighted_low = low_losses.mean(dim=0).mean()
             weighted_high = high_losses.mean(dim=0).mean()
+            weighted_color = color_losses.mean(dim=0).mean()
 
-        # 2. Refine Loss - Đảm bảo loop sau cải thiện
         refine_loss = 0.0
         if T > 1 and self.refine_weight > 0:
             for t in range(1, T):
@@ -189,7 +227,6 @@ class Stage1Loss(nn.Module):
                 refine_loss += F.relu(improvement).mean()
             refine_loss = refine_loss / (T - 1)
 
-        # 3. KL Loss (giữ lại để model chia đều weight)
         kl_loss = 0.0
         if halting_weights is not None and self.kl_weight > 0:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
@@ -199,6 +236,7 @@ class Stage1Loss(nn.Module):
         # === Tổng loss ===
         total_loss = (
             self.trajectory_weight * weighted_rec +
+            self.color_weight * weighted_color +
             self.refine_weight * refine_loss +
             self.kl_weight * kl_loss
         )
@@ -208,6 +246,7 @@ class Stage1Loss(nn.Module):
             "loss/rec_weighted": weighted_rec.item(),
             "loss/freq_low": weighted_low.item(),
             "loss/freq_high": weighted_high.item(),
+            "loss/color_cosine": weighted_color.item(),
             "loss/refine": float(refine_loss),
             "loss/kl": float(kl_loss),
         }
