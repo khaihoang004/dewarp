@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from .repconv import RepConv3, RepConv7
 from .attention import DocumentAttn, RestormerAttention
+from src.model.monarch_attn.monarch_attention import MonarchAttention
 
 
 class RMSNorm2d(nn.Module):
@@ -82,9 +83,14 @@ class ResidualRepConv(nn.Module):
 class BottleneckBlock(nn.Module):
     def __init__(self, dim, deploy=False):
         super().__init__()
-        # Global (Attention)
+        # Global (Attention) - ĐÃ THAY BẰNG MONARCH
         self.norm1 = RMSNorm2d(dim)
-        self.attn = RestormerAttention(dim)
+        self.attn = MonarchAttention(
+            block_size=32,
+            num_steps=5,
+            pad_type="post",
+            impl="torch"
+        )
         self.scale1 = LayerScale(dim, init_value=0.5)
         
         # Local (Convolution)
@@ -98,7 +104,23 @@ class BottleneckBlock(nn.Module):
         self.scale3 = LayerScale(dim, init_value=0.5)
         
     def forward(self, x):
-        x = x + self.scale1(self.attn(self.norm1(x)))
+        B, C, H, W = x.shape
+        
+        # Reshape for MonarchAttention
+        num_heads = 4
+        head_dim = C // num_heads
+        
+        x_norm = self.norm1(x)
+        x_flat = x_norm.view(B, C, H*W).transpose(1, 2)                    # [B, N, C]
+        x_multihead = x_flat.view(B, H*W, num_heads, head_dim).transpose(1, 2)  # [B, heads, N, head_dim]
+        
+        # Forward Monarch
+        attn_out = self.attn(x_multihead, x_multihead, x_multihead)
+        # Reshape về spatial
+        attn_out = attn_out.transpose(1, 2).reshape(B, C, H, W)
+        # Residual
+        x = x + self.scale1(attn_out)
+        
         x = x + self.scale2(self.conv(self.norm2(x)))
         x = x + self.scale3(self.ffn(self.norm3(x)))
         return x
