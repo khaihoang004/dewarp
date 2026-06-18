@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_msssim import ssim
 import torchvision.models as models
+import kornia.color as kc
 
 
 class CharbonnierLoss(nn.Module):
@@ -56,29 +57,34 @@ class VGGPerceptualLoss(nn.Module):
 
         return loss
 
-class ColorCosineLoss(nn.Module):
-    def __init__(self, weight_low_freq=1.5, eps=1e-6):
+class LABFrequencyColorLoss(nn.Module):
+    def __init__(self, weight_low_freq=1.8, weight_l=1.0, weight_a=2.0, weight_b=2.0, cutoff_freq=20):
         super().__init__()
         self.weight_low_freq = weight_low_freq
-        self.eps = eps
-        self.freq_sep = FFTSeparator(cutoff_freq=20)
+        self.weight_l = weight_l
+        self.weight_a = weight_a
+        self.weight_b = weight_b
+        
+        self.freq_sep = FFTSeparator(cutoff_freq=cutoff_freq)
+        self.l1_loss = nn.L1Loss(reduction='mean')
+
+    def _lab_loss(self, pred, target):
+        pred_lab = kc.rgb_to_lab(pred)
+        target_lab = kc.rgb_to_lab(target)
+
+        loss_l = self.l1_loss(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :])
+        loss_a = self.l1_loss(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :])
+        loss_b = self.l1_loss(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :])
+
+        return (self.weight_l * loss_l) + (self.weight_a * loss_a) + (self.weight_b * loss_b)
 
     def forward(self, pred, target):
-        b, c, h, w = pred.shape
-        pred_flat = pred.view(b, c, -1)
-        target_flat = target.view(b, c, -1)
-        
-        global_cos = F.cosine_similarity(pred_flat + self.eps, target_flat + self.eps, dim=1)
-        global_loss = 1.0 - global_cos.mean()
+        global_loss = self._lab_loss(pred, target)
 
         pred_low, _ = self.freq_sep(pred)
         target_low, _ = self.freq_sep(target)
         
-        pred_low_flat = pred_low.view(b, c, -1)
-        target_low_flat = target_low.view(b, c, -1)
-        
-        low_cos = F.cosine_similarity(pred_low_flat + self.eps, target_low_flat + self.eps, dim=1)
-        low_loss = 1.0 - low_cos.mean()
+        low_loss = self._lab_loss(pred_low, target_low)
 
         total_loss = global_loss + self.weight_low_freq * low_loss
         return total_loss
@@ -160,7 +166,7 @@ class Stage1Loss(nn.Module):
         self.charbonnier = CharbonnierLoss()
         self.freq_separator = FFTSeparator(cutoff_freq=25)
         self.vgg_loss = VGGPerceptualLoss()
-        self.color_cosine_loss = ColorCosineLoss(weight_low_freq=color_low_freq_weight)
+        self.color_loss_fn = LABFrequencyColorLoss(weight_low_freq=color_low_freq_weight)
 
     def reconstruction_loss(self, pred, target):
         pred_low, pred_high = self.freq_separator(pred)
@@ -171,7 +177,7 @@ class Stage1Loss(nn.Module):
         
         freq_loss = self.low_weight * low_loss + self.high_weight * high_loss
         perceptual = self.vgg_loss(pred, target)
-        color_loss = self.color_cosine_loss(pred, target)
+        color_loss = self.color_loss_fn(pred, target)
 
         combined = freq_loss + self.perceptual_weight * perceptual + self.color_weight * color_loss
 
@@ -197,9 +203,7 @@ class Stage1Loss(nn.Module):
         high_losses  = torch.stack(high_losses, dim=0)
         color_losses = torch.stack(color_losses, dim=0)
 
-        # === Weighted Loss (phần hay lỗi) ===
         if halting_weights is not None:
-            # halting_weights thường có shape [T, B]
             if halting_weights.dim() == 2:
                 q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)  # [T, B]
                 q = q.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)   # broadcast cho [T, B, 1,1,1]
@@ -216,7 +220,7 @@ class Stage1Loss(nn.Module):
             weighted_high  = high_losses.mean()
             weighted_color = color_losses.mean()
 
-        # Refine & KL Loss (giữ nguyên)
+        # Refine & KL Loss
         refine_loss = 0.0
         if T > 1 and self.refine_weight > 0:
             for t in range(1, T):
@@ -242,7 +246,7 @@ class Stage1Loss(nn.Module):
             "loss/rec_weighted": weighted_rec.item(),
             "loss/freq_low": weighted_low.item(),
             "loss/freq_high": weighted_high.item(),
-            "loss/color_cosine": weighted_color.item(),
+            "loss/color_lab": weighted_color.item(),
             "loss/refine": float(refine_loss),
             "loss/kl": float(kl_loss),
         }
@@ -310,7 +314,7 @@ class Stage2Loss(nn.Module):
 
         policy_loss /= max(T - 1, 1)
 
-        # Ponder loss truyền thống (phạt số bước dự kiến)
+        # Ponder loss truyền thống
         expected_steps = torch.sum(
             (torch.arange(1, T+1, device=halting_weights.device).float().view(-1, 1) * halting_weights), 
             dim=0
