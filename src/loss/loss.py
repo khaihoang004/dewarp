@@ -225,7 +225,7 @@ class Stage1Loss(nn.Module):
         refine_loss = 0.0
         if T > 1 and self.refine_weight > 0:
             for t in range(1, T):
-                improvement = rec_losses[t-1] - rec_losses[t]
+                improvement = rec_losses[t] - rec_losses[t-1]
                 refine_loss += F.relu(improvement).mean()
             refine_loss = refine_loss / (T - 1)
 

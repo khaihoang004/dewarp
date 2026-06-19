@@ -117,29 +117,25 @@ def train_one_epoch(
         if aug is not None:
             inp, gt = aug(inp, gt)
 
-        with autocast(
-            device_type="cuda",
-            enabled=cfg.use_amp
-        ):
-            outputs = model(inp, return_all=True)
-            pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
+        outputs = model(inp, return_all=True)
+        pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
 
-            if stage == 1:
-                loss, loss_dict = criterion(
-                    target=gt,
-                    final_pred=pred,
-                    intermediate_preds=intermediate_preds,
-                    halting_weights=halting_weights,
-                    current_epoch=epoch 
-                )
-            else:
-                loss, loss_dict = criterion(
-                    target=gt,
-                    final_pred=pred,
-                    intermediate_preds=intermediate_preds,
-                    halting_weights=halting_weights,
-                    halt_logits=gate_logits
-                )
+        if stage == 1:
+            loss, loss_dict = criterion(
+                target=gt,
+                final_pred=pred,
+                intermediate_preds=intermediate_preds,
+                halting_weights=halting_weights,
+                current_epoch=epoch 
+            )
+        else:
+            loss, loss_dict = criterion(
+                target=gt,
+                final_pred=pred,
+                intermediate_preds=intermediate_preds,
+                halting_weights=halting_weights,
+                halt_logits=gate_logits
+            )
 
         loss_raw = loss.item()
 
@@ -149,8 +145,29 @@ def train_one_epoch(
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            first_param = next(model.parameters())
+
+            grad_mean = (
+                first_param.grad.abs().mean().item()
+                if first_param.grad is not None
+                else -1
+            )
+
+            weight_before = first_param.detach().mean().item()
+
+            print(
+                f"[DEBUG] grad={grad_mean:.8f} "
+                f"weight_before={weight_before:.8f}"
+            )
+            
             scaler.step(optimizer)
             scaler.update()
+            weight_after = first_param.detach().mean().item()
+
+            print(
+                f"[DEBUG] weight_after={weight_after:.8f} "
+                f"delta={abs(weight_after-weight_before):.12f}"
+            )
             optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss_raw
@@ -207,7 +224,11 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True):
             outputs = model(inp, return_all=True)
 
         pred, inter_preds, halt_w, halt_logits, _ = outputs
-
+        if i == 0:
+            print(
+                f"[VAL] pred mean={pred.mean().item():.6f} "
+                f"std={pred.std().item():.6f}"
+            )
         T = len(inter_preds)
         batch_size = inp.size(0)
 
