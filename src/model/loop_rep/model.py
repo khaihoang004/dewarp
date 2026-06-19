@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from .repconv import RepConv3, RepConv7
 from .attention import DocumentAttn, RestormerAttention
+from src.model.monarch_attn.monarch_attention import MonarchAttention
 
 
 class RMSNorm2d(nn.Module):
@@ -58,7 +59,6 @@ class ResidualRepConv(nn.Module):
         self.deploy = deploy
         self.conv_1 = RepConv3(in_channels, out_channels, groups, deploy=deploy)
         self.act_1 = nn.GELU()
-        
         self.conv_2 = RepConv3(out_channels, out_channels, groups, deploy=deploy)
         self.act_2 = nn.GELU()
 
@@ -66,10 +66,8 @@ class ResidualRepConv(nn.Module):
         if not self.deploy:
             self.conv_1.fuse()
             self.conv_2.fuse()
-            
             if hasattr(self.conv_1, 'deploy'): self.conv_1.deploy = True
             if hasattr(self.conv_2, 'deploy'): self.conv_2.deploy = True
-            
             self.deploy = True
 
     def forward(self, x):
@@ -80,47 +78,66 @@ class ResidualRepConv(nn.Module):
         return out + x
 
 class BottleneckBlock(nn.Module):
-    def __init__(self, dim, deploy=False):
+    def __init__(self, dim, num_heads=4, deploy=False):
         super().__init__()
+        assert dim % num_heads == 0, f"dim ({dim}) phải chia hết cho num_heads ({num_heads})"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
         # Global (Attention)
         self.norm1 = RMSNorm2d(dim)
-        self.attn = RestormerAttention(dim)
+        self.attn = MonarchAttention(
+            block_size=32,
+            num_steps=5,
+            pad_type="post",
+            impl="torch"
+        )
         self.scale1 = LayerScale(dim, init_value=0.5)
-        
+
         # Local (Convolution)
         self.norm2 = RMSNorm2d(dim)
         self.conv = RepConv3(dim, dim, groups=1, deploy=deploy)
         self.scale2 = LayerScale(dim, init_value=0.5)
-        
+
         # Channel (FFN)
         self.norm3 = RMSNorm2d(dim)
         self.ffn = SwiGLU_FFN(dim)
         self.scale3 = LayerScale(dim, init_value=0.5)
-        
+
     def forward(self, x):
-        x = x + self.scale1(self.attn(self.norm1(x)))
+        B, C, H, W = x.shape
+
+        x_norm = self.norm1(x)
+        # [B, N, C] -> [B, heads, N, head_dim]
+        x_flat = x_norm.view(B, C, H * W).transpose(1, 2)                              # [B, N, C]
+        x_multihead = x_flat.view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, N, head_dim]
+
+        attn_out = self.attn(x_multihead, x_multihead, x_multihead)
+        # Reshape về [B, C, H, W]
+        attn_out = attn_out.transpose(1, 2).reshape(B, C, H, W)
+        x = x + self.scale1(attn_out)
+
         x = x + self.scale2(self.conv(self.norm2(x)))
         x = x + self.scale3(self.ffn(self.norm3(x)))
         return x
 
 class BottleneckLayer(nn.Module):
-    def __init__(self, dim, num_blocks=1):
+    def __init__(self, dim, num_blocks=1, num_heads=4):
         super().__init__()
-        self.blocks = nn.ModuleList([BottleneckBlock(dim) for _ in range(num_blocks)])
-        
+        self.blocks = nn.ModuleList([BottleneckBlock(dim, num_heads=num_heads) for _ in range(num_blocks)])
+
         self.fusion = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1),
             nn.GELU(),
             nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
             nn.GELU(),
         )
-        
-        # Entropy-based exit head
+
         self.exit_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, dim//4, 1),
+            nn.Conv2d(dim, dim // 4, 1),
             nn.GELU(),
-            nn.Conv2d(dim//4, 1, 1),
+            nn.Conv2d(dim // 4, 1, 1),
         )
 
     def forward(self, x, x_orig, step_embed=None):
@@ -133,7 +150,6 @@ class BottleneckLayer(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        # Exit logit
         exit_logit = self.exit_head(x).view(-1)
         exit_prob = torch.sigmoid(exit_logit)
 
@@ -141,18 +157,21 @@ class BottleneckLayer(nn.Module):
 
 
 class AdaptiveLoopedBottleneck(nn.Module):
-    def __init__(self, dim, max_loops=6):
+    def __init__(self, dim, max_loops=6, num_heads=4):
         super().__init__()
         self.max_loops = max_loops
-        self.layer = BottleneckLayer(dim)
+        self.layer = BottleneckLayer(dim, num_heads=num_heads)
 
         self.step_embeddings = nn.Parameter(torch.zeros(max_loops, 1, dim, 1, 1))
         nn.init.normal_(self.step_embeddings, std=0.02)
-    
+
     def forward(self, x, halt_threshold=0.85, return_all=False):
         B = x.shape[0]
         device = x.device
-        x_orig = x.detach() if not self.training else x.clone()
+        if self.training or return_all:
+            x_orig = x.clone()
+        else:
+            x_orig = x.detach()
 
         if self.training or return_all:
             states = []
@@ -164,18 +183,17 @@ class AdaptiveLoopedBottleneck(nn.Module):
                 step_embed = self.step_embeddings[t]
                 state_with_step = state + step_embed
 
-                # Forward 1 step
                 state, g_logit, e_prob = self.layer(state_with_step, x_orig, step_embed)
 
                 states.append(state)
                 exit_probs_list.append(e_prob)
                 logits_list.append(g_logit)
 
-            exit_probs = torch.stack(exit_probs_list, dim=0)      # (T, B)
-            gate_logits = torch.stack(logits_list, dim=0)         # (T, B)
+            exit_probs = torch.stack(exit_probs_list, dim=0)   # (T, B)
+            gate_logits = torch.stack(logits_list, dim=0)      # (T, B)
 
             survival = torch.ones(B, device=device)
-            halting_weights = torch.zeros_like(exit_probs)        # (T, B)
+            halting_weights = torch.zeros_like(exit_probs)     # (T, B)
 
             for t in range(self.max_loops):
                 if t < self.max_loops - 1:
@@ -245,7 +263,7 @@ class EncoderStage(nn.Module):
 
         for layer in self.stacked_layers:
             feat = layer(feat)
-            
+
         skip_feat = self.norm_feat(feat)
 
         downsampled = self.down(skip_feat)
@@ -270,48 +288,50 @@ class DecoderStage(nn.Module):
             ResidualRepConv(out_channels, out_channels, groups=1, deploy=deploy)
             for _ in range(num_blocks)
         ])
-        
+
         self.norm_out = LayerNorm2d(out_channels)
 
     def forward(self, x, skip_feat):
         x = self.expand_channels(x)
         x = self.up(x)
         x = self.act_up(x)
-        
+
         gate_mask = torch.sigmoid(self.gate_conv(x))
         gated_skip = skip_feat * gate_mask
 
         x = torch.cat([x, gated_skip], dim=1)
         x = self.act(self.conv(x))
-        
+
         for layer in self.stacked_layers:
             x = layer(x)
-            
+
         return self.norm_out(x)
 
 
 class LoopRepDocEnhanceNet(nn.Module):
-    def __init__(self, base_dim=32, max_loops=4, enc_blocks=[1, 1, 2], dec_blocks=[1, 1, 2], deploy=False):
+    def __init__(self, base_dim=32, max_loops=4, num_heads=4, enc_blocks=[1, 1, 2], dec_blocks=[1, 1, 2], deploy=False):
         super().__init__()
         self.base_dim = base_dim
-        
+
         if isinstance(enc_blocks, int):
             enc_blocks = [enc_blocks] * 3
         if isinstance(dec_blocks, int):
             dec_blocks = [dec_blocks] * 3
-            
+
         self.shallow_extractor = ShallowExtractor(3, base_dim, deploy=deploy)
-        
+
         self.enc1 = EncoderStage(base_dim, base_dim, num_blocks=enc_blocks[0], deploy=deploy)
         self.enc2 = EncoderStage(base_dim, base_dim * 2, num_blocks=enc_blocks[1], deploy=deploy)
         self.enc3 = EncoderStage(base_dim * 2, base_dim * 4, num_blocks=enc_blocks[2], deploy=deploy)
-        
-        self.bottleneck = AdaptiveLoopedBottleneck(dim=base_dim * 4, max_loops=max_loops)
-        
+
+        assert (base_dim * 4) % num_heads == 0, \
+            f"base_dim*4 ({base_dim*4}) can be divided by num_heads ({num_heads})"
+        self.bottleneck = AdaptiveLoopedBottleneck(dim=base_dim * 4, max_loops=max_loops, num_heads=num_heads)
+
         self.dec3 = DecoderStage(base_dim * 4, base_dim * 4, base_dim * 2, num_blocks=dec_blocks[2], deploy=deploy)
         self.dec2 = DecoderStage(base_dim * 2, base_dim * 2, base_dim, num_blocks=dec_blocks[1], deploy=deploy)
         self.dec1 = DecoderStage(base_dim, base_dim, base_dim, num_blocks=dec_blocks[0], deploy=deploy)
-        
+
         self.final_head = nn.Sequential(
             RepConv3(base_dim, base_dim, deploy=deploy),
             nn.GELU(),
@@ -327,20 +347,22 @@ class LoopRepDocEnhanceNet(nn.Module):
         return output
 
     def forward(self, x, halt_threshold=0.80, return_all=False):
-        x_ori = x 
-        
+        x_ori = x.clone()
+
         s0 = self.shallow_extractor(x)
         skip1, e1 = self.enc1(s0)
         skip2, e2 = self.enc2(e1)
         skip3, e3 = self.enc3(e2)
-        
+
         if self.training or return_all:
-            b_out, layer_outputs, halting_weights, gate_logits, exit_probs = self.bottleneck(e3, halt_threshold=halt_threshold, return_all=return_all)
+            b_out, layer_outputs, halting_weights, gate_logits, exit_probs = self.bottleneck(
+                e3, halt_threshold=halt_threshold, return_all=True
+            )
         else:
             b_out = self.bottleneck(e3, halt_threshold=halt_threshold)
 
         output = self._decode(b_out, skip1, skip2, skip3, x_ori)
-        
+
         if not self.training:
             output = torch.clamp(output, 0.0, 1.0)
 
@@ -368,5 +390,5 @@ class LoopRepDocEnhanceNet(nn.Module):
             ):
                 module.fuse()
                 fused.append(name)
- 
+
         print(f">>> ĐÃ FUSE {len(fused)} MODULE: {fused}")

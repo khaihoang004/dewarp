@@ -26,14 +26,14 @@ class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
         vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
-        
+
         self.slice1 = vgg[:4]
         self.slice2 = vgg[4:9]
         self.slice3 = vgg[9:16]
-        
+
         for p in self.parameters():
             p.requires_grad = False
-            
+
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
@@ -58,6 +58,7 @@ class VGGPerceptualLoss(nn.Module):
 
         return loss
 
+
 class LABFrequencyColorLoss(nn.Module):
     def __init__(self, weight_low_freq=1.8, weight_l=1.0, weight_a=2.0, weight_b=2.0, cutoff_freq=20):
         super().__init__()
@@ -65,9 +66,9 @@ class LABFrequencyColorLoss(nn.Module):
         self.weight_l = weight_l
         self.weight_a = weight_a
         self.weight_b = weight_b
-        
+
         self.freq_sep = FFTSeparator(cutoff_freq=cutoff_freq)
-        self.l1_loss = nn.L1Loss(reduction='none') 
+        self.l1_loss = nn.L1Loss(reduction='none')
 
     def _lab_loss(self, pred, target):
         pred_lab = kc.rgb_to_lab(pred)
@@ -78,18 +79,19 @@ class LABFrequencyColorLoss(nn.Module):
         loss_b = self.l1_loss(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :]).mean(dim=[1, 2, 3])
 
         total_lab = (self.weight_l * loss_l) + (self.weight_a * loss_a) + (self.weight_b * loss_b)
-        return total_lab / 100.0 
+        return total_lab / 100.0
 
     def forward(self, pred, target):
         global_loss = self._lab_loss(pred, target)
 
         pred_low, _ = self.freq_sep(pred)
         target_low, _ = self.freq_sep(target)
-        
+
         low_loss = self._lab_loss(pred_low, target_low)
 
         total_loss = global_loss + self.weight_low_freq * low_loss
         return total_loss
+
 
 class FrequencySeparator(nn.Module):
     def __init__(self, kernel_size=5, sigma=1.0, channels=3):
@@ -123,24 +125,24 @@ class FFTSeparator(nn.Module):
 
     def forward(self, x):
         _, _, H, W = x.shape
-        
+
         fft_x = torch.fft.fft2(x)
         fft_x_shifted = torch.fft.fftshift(fft_x, dim=(-2, -1))
-        
+
         Y, X = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
         center_y, center_x = H // 2, W // 2
         dist_from_center = torch.sqrt((Y - center_y)**2 + (X - center_x)**2).to(x.device)
-        
+
         mask = torch.exp(-(dist_from_center**2) / (2 * (self.cutoff_freq**2)))
-        mask = mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
-        
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
         low_fft = fft_x_shifted * mask
-        
+
         low_fft_unshifted = torch.fft.ifftshift(low_fft, dim=(-2, -1))
         low_freq = torch.fft.ifft2(low_fft_unshifted).real
-        
+
         high_freq = x - low_freq
-        
+
         return low_freq, high_freq
 
 
@@ -173,10 +175,10 @@ class Stage1Loss(nn.Module):
     def reconstruction_loss(self, pred, target):
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
-        
+
         low_loss = self.charbonnier(pred_low, target_low, reduction='batchmean')
         high_loss = self.charbonnier(pred_high, target_high, reduction='batchmean')
-        
+
         freq_loss = self.low_weight * low_loss + self.high_weight * high_loss
         perceptual = self.vgg_loss(pred, target)
         color_loss = self.color_loss_fn(pred, target)
@@ -221,17 +223,18 @@ class Stage1Loss(nn.Module):
             weighted_high  = high_losses.mean()
             weighted_color = color_losses.mean()
 
-        # Refine & KL Loss
+        # Refine Loss
         refine_loss = 0.0
         if T > 1 and self.refine_weight > 0:
             for t in range(1, T):
-                improvement = rec_losses[t] - rec_losses[t-1]
+                improvement = rec_losses[t] - rec_losses[t - 1]
                 refine_loss += F.relu(improvement).mean()
             refine_loss = refine_loss / (T - 1)
 
         kl_loss = 0.0
         if halting_weights is not None and self.kl_weight > 0:
             q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)
+            q = q.clamp(min=1e-8)
             uniform_prior = torch.ones_like(q) / T
             kl_loss = F.kl_div(q.log(), uniform_prior, reduction='batchmean')
 
@@ -248,8 +251,8 @@ class Stage1Loss(nn.Module):
             "loss/freq_low": weighted_low.item(),
             "loss/freq_high": weighted_high.item(),
             "loss/color_lab": weighted_color.item(),
-            "loss/refine": float(refine_loss),
-            "loss/kl": float(kl_loss),
+            "loss/refine": float(refine_loss) if isinstance(refine_loss, float) else refine_loss.item(),
+            "loss/kl": float(kl_loss) if isinstance(kl_loss, float) else kl_loss.item(),
         }
 
         return total_loss, loss_dict
@@ -264,7 +267,7 @@ class Stage2Loss(nn.Module):
         self.charbonnier = CharbonnierLoss()
 
     def reconstruction_loss(self, pred, target):
-        charb = self.charbonnier(pred, target, reduction='batchmean') 
+        charb = self.charbonnier(pred, target, reduction='batchmean')
         pred_clamp = torch.clamp(pred, 0.0, 1.0)
         ssim_val = ssim(pred_clamp, target, data_range=1.0, size_average=False)
         ssim_loss = 1.0 - ssim_val
@@ -273,7 +276,7 @@ class Stage2Loss(nn.Module):
 
     def forward(self, target, final_pred, intermediate_preds, halting_weights, halt_logits, **kwargs):
         T = len(intermediate_preds)
-        
+
         step_losses = []
         avg_charb = avg_ssim = 0.0
 
@@ -288,40 +291,35 @@ class Stage2Loss(nn.Module):
         avg_ssim /= T
 
         # RLTT Policy Loss
-        exit_probs = [torch.sigmoid(l.view(-1)) for l in halt_logits]
+        exit_probs = [torch.sigmoid(halt_logits[t].view(-1)) for t in range(T)]
         policy_loss = 0.0
-        
+
         for t in range(T):
             curr_loss = step_losses[t]
-            
-            # Advantage
+
             if t == 0:
                 advantage_t = torch.zeros_like(curr_loss)
             else:
-                advantage_t = (step_losses[t-1] - curr_loss).detach()
+                advantage_t = (step_losses[t - 1] - curr_loss).detach()
 
-            p_t = exit_probs[t].clamp(1e-6, 1.0 - 1e-6) # (B,)
-            
+            p_t = exit_probs[t].clamp(1e-6, 1.0 - 1e-6)  # (B,)
+
             pos_mask = (advantage_t > 0).float()
             neg_mask = (advantage_t <= 0).float()
-            
-            # RLTT Logic cốt lõi: 
-            # - Có tiến bộ (Advantage > 0) -> phạt p_t (kích thích vòng lặp đi tiếp)
-            # - Kém đi hoặc bằng (Advantage <= 0) -> phạt (1 - p_t) (kích thích vòng lặp dừng ngay lập tức)
+
             loss_pos = advantage_t * (-torch.log(1 - p_t)) * pos_mask
             loss_neg = (-advantage_t) * (-torch.log(p_t)) * neg_mask
-            
+
             policy_loss += (loss_pos + loss_neg).mean()
 
         policy_loss /= max(T - 1, 1)
 
-        # Ponder loss truyền thống
+        # Ponder loss
         expected_steps = torch.sum(
-            (torch.arange(1, T+1, device=halting_weights.device).float().view(-1, 1) * halting_weights), 
+            (torch.arange(1, T + 1, device=halting_weights.device).float().view(-1, 1) * halting_weights),
             dim=0
         ).mean()
 
-        # Tổng hợp Loss cho Stage 2
         total_loss = self.rltt_weight * policy_loss + self.ponder_weight * expected_steps
 
         loss_dict = {

@@ -44,13 +44,13 @@ def make_vis(inp, pred, gt):
 
     def to_np(x):
         x = x.detach().float().cpu()
-        if x.dim() == 4: 
+        if x.dim() == 4:
             x = x.squeeze(0)
         x = torch.clamp(x, 0, 1)
         return x.permute(1, 2, 0).numpy()
 
     vis = np.concatenate([to_np(inp), to_np(pred), to_np(gt)], axis=1)
-    
+
     metrics = {
         "psnr": psnr,
         "ssim": ssim_score,
@@ -75,12 +75,12 @@ def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logit
             vis, metrics = make_vis(inp_b, pred_t, gt_b)
 
             exit_prob = torch.sigmoid(halt_logits[t][b]).mean().item() if halt_logits is not None else 0.0
-            act_w = halting_weights[t][b].mean().item()
+            act_w = halting_weights[t, b].item()
 
             caption = (f"{t+1}/{T} | Exit: {exit_prob*100:.1f}% | "
-                      f"Weight: {act_w:.3f} | PSNR={metrics['psnr']:.2f} | "
-                      f"RMSE={metrics['rmse']:.4f} | "
-                      f"SSIM={metrics['ssim']:.4f} | MS-SSIM={metrics['ms_ssim']:.4f}")
+                       f"Weight: {act_w:.3f} | PSNR={metrics['psnr']:.2f} | "
+                       f"RMSE={metrics['rmse']:.4f} | "
+                       f"SSIM={metrics['ssim']:.4f} | MS-SSIM={metrics['ms_ssim']:.4f}")
 
             loop_images.append(wandb.Image(vis, caption=caption))
 
@@ -90,7 +90,7 @@ def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logit
 
 
 def train_one_epoch(
-    model, loader, optimizer, scaler, criterion, device, epoch, cfg, 
+    model, loader, optimizer, scaler, criterion, device, epoch, cfg,
     aug=None, stage=1, global_step=0,
     accumulation_steps=4, max_steps_per_epoch=500
 ):
@@ -117,25 +117,26 @@ def train_one_epoch(
         if aug is not None:
             inp, gt = aug(inp, gt)
 
-        outputs = model(inp, return_all=True)
-        pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
+        with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
+            outputs = model(inp, return_all=True)
+            pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
 
-        if stage == 1:
-            loss, loss_dict = criterion(
-                target=gt,
-                final_pred=pred,
-                intermediate_preds=intermediate_preds,
-                halting_weights=halting_weights,
-                current_epoch=epoch 
-            )
-        else:
-            loss, loss_dict = criterion(
-                target=gt,
-                final_pred=pred,
-                intermediate_preds=intermediate_preds,
-                halting_weights=halting_weights,
-                halt_logits=gate_logits
-            )
+            if stage == 1:
+                loss, loss_dict = criterion(
+                    target=gt,
+                    final_pred=pred,
+                    intermediate_preds=intermediate_preds,
+                    halting_weights=halting_weights,
+                    current_epoch=epoch
+                )
+            else:
+                loss, loss_dict = criterion(
+                    target=gt,
+                    final_pred=pred,
+                    intermediate_preds=intermediate_preds,
+                    halting_weights=halting_weights,
+                    halt_logits=gate_logits
+                )
 
         loss_raw = loss.item()
 
@@ -169,7 +170,7 @@ def train_one_epoch(
                 f"[DEBUG] grad={grad_mean:.8f} "
                 f"weight_before={weight_before:.8f}"
             )
-            
+
             scaler.step(optimizer)
             scaler.update()
             weight_after = first_param.detach().mean().item()
@@ -182,19 +183,10 @@ def train_one_epoch(
 
         running_loss += loss_raw
 
-        halt_stack = torch.stack([
-            h.mean(dim=tuple(range(1, h.dim())))
-            for h in halting_weights
-        ], dim=0)
-
-        step_ids = torch.arange(
-            1,
-            len(intermediate_preds) + 1,
-            device=halt_stack.device
-        ).float().view(-1, 1)
-
-        expected_steps = (step_ids * halt_stack).sum(dim=0).mean().item()
-        hard_steps = halt_stack.argmax(dim=0).float().mean().item() + 1
+        T_steps = halting_weights.shape[0]
+        step_ids = torch.arange(1, T_steps + 1, device=halting_weights.device).float().view(-1, 1)  # [T, 1]
+        expected_steps = (step_ids * halting_weights).sum(dim=0).mean().item()
+        hard_steps = halting_weights.argmax(dim=0).float().mean().item() + 1
 
         if batch_idx == total_steps - 1:
             wandb.log({
@@ -214,13 +206,11 @@ def train_one_epoch(
 # VALIDATION
 @torch.no_grad()
 def validate(model, loader, device, cfg, global_step=0, log_images=True):
-    params_hash = sum(p.sum().item() for p in model.parameters())
-    print(f"[VAL] model params hash: {params_hash:.4f}")
     model.eval()
 
     loop_psnr_sums = None
     loop_ssim_sums = None
-    
+
     psnr_sum = 0.0
     ssim_sum = 0.0
     ms_ssim_sum = 0.0
@@ -250,16 +240,16 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True):
 
         for b in range(batch_size):
             g_img = gt[b:b+1]
-            
+
             psnr_sum += compute_psnr(pred[b:b+1], g_img)
             ssim_sum += compute_ssim(pred[b:b+1], g_img)
             ms_ssim_sum += compute_ms_ssim(pred[b:b+1], g_img)
             rmse_sum += compute_rmse(pred[b:b+1], g_img)
-            
+
             for t in range(T):
                 loop_psnr_sums[t] += compute_psnr(inter_preds[t][b:b+1], g_img)
                 loop_ssim_sums[t] += compute_ssim(inter_preds[t][b:b+1], g_img)
-                
+
             total_images += 1
 
         if i == 0 and log_images:
@@ -271,7 +261,7 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True):
         "val/ms_ssim": ms_ssim_sum / total_images,
         "val/rmse": rmse_sum / total_images,
     }
-    
+
     for t in range(T):
         val_metrics[f"val_loops/loop_{t+1}_psnr"] = loop_psnr_sums[t] / total_images
         val_metrics[f"val_loops/loop_{t+1}_ssim"] = loop_ssim_sums[t] / total_images
@@ -294,17 +284,17 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Load checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        
+
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])   # ← thêm
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])   # ← thêm
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
+
         start_epoch = checkpoint['epoch'] + 1
         global_step = checkpoint['global_step']
         best_psnr = checkpoint.get('best_psnr', 0.0)
-        
-        print(f"Continue training from epoch {start_epoch}.")
+
+        print(f"Continue training from epoch {start_epoch}, best_psnr={best_psnr:.3f}.")
     else:
         print("No valid checkpoint found or resume_checkpoint is empty. Training from scratch.")
 
@@ -340,7 +330,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         }, step=global_step)
 
         current_psnr = val_metrics["val/psnr"]
-        
+
         # 3. SAVE BEST MODEL
         if current_psnr > best_psnr:
             best_psnr = current_psnr
