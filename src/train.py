@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 from torch.amp import autocast, GradScaler
 from pytorch_msssim import ms_ssim, ssim
+import glob
 
 
 @torch.no_grad()
@@ -59,7 +60,7 @@ def make_vis(inp, pred, gt):
     return vis, metrics
 
 
-def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, global_step, max_samples=4):
+def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logits, max_samples=4):
     T = len(intermediate_preds)
     B = min(inp.size(0), max_samples)
     log_dict = {}
@@ -85,7 +86,7 @@ def log_loop_steps(inp, gt, intermediate_preds, halting_weights, halt_logits, gl
 
         log_dict[f"val/sample_{b}_progress"] = loop_images
 
-    wandb.log(log_dict, step=global_step)
+    return log_dict
 
 
 def train_one_epoch(
@@ -185,7 +186,7 @@ def train_one_epoch(
 
 # VALIDATION
 @torch.no_grad()
-def validate(model, loader, device, global_step=0, log_images=True):
+def validate(model, loader, device, cfg, global_step=0, log_images=True):
     model.eval()
 
     loop_psnr_sums = None
@@ -196,12 +197,15 @@ def validate(model, loader, device, global_step=0, log_images=True):
     ms_ssim_sum = 0.0
     rmse_sum = 0.0
     total_images = 0
+    image_logs = {}
 
     for i, batch in enumerate(tqdm(loader, desc="Validating Progressively")):
         inp = batch["inp"].to(device)
         gt = batch["gt"].to(device)
 
-        outputs = model(inp, return_all=True)
+        with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
+            outputs = model(inp, return_all=True)
+
         pred, inter_preds, halt_w, halt_logits, _ = outputs
 
         T = len(inter_preds)
@@ -226,7 +230,7 @@ def validate(model, loader, device, global_step=0, log_images=True):
             total_images += 1
 
         if i == 0 and log_images:
-            log_loop_steps(inp, gt, inter_preds, halt_w, halt_logits, global_step)
+            image_logs = get_loop_steps_logs(inp, gt, inter_preds, halt_w, halt_logits)
 
     val_metrics = {
         "val/psnr": psnr_sum / total_images,
@@ -239,6 +243,8 @@ def validate(model, loader, device, global_step=0, log_images=True):
         val_metrics[f"val_loops/loop_{t+1}_psnr"] = loop_psnr_sums[t] / total_images
         val_metrics[f"val_loops/loop_{t+1}_ssim"] = loop_ssim_sums[t] / total_images
 
+    val_metrics.update(image_logs)
+
     return val_metrics
 
 
@@ -250,14 +256,14 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
     start_epoch = 0
 
     # 1. RELOAD CHECKPOINT
-    checkpoint_path = getattr(cfg, "resume_checkpoint", f"latest_checkpoint_stage{stage}.pth")
-    if os.path.exists(checkpoint_path):
+    checkpoint_path = getattr(cfg, "resume_checkpoint", None)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Load checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         start_epoch = checkpoint['epoch'] + 1
@@ -265,6 +271,8 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         best_psnr = checkpoint.get('best_psnr', 0.0)
         
         print(f"Continue training from epoch {start_epoch}.")
+    else:
+        print("No valid checkpoint found or resume_checkpoint is empty. Training from scratch.")
 
     accumulation_steps = getattr(cfg, "accumulation_steps", 4)
     max_steps_per_epoch = getattr(cfg, "max_steps_per_epoch", 500)
@@ -287,7 +295,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
             max_steps_per_epoch=max_steps_per_epoch
         )
 
-        val_metrics = validate(model, val_loader, device, global_step=global_step)
+        val_metrics = validate(model, val_loader, device, cfg, global_step=global_step)
         scheduler.step()
 
         wandb.log({
@@ -302,7 +310,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         # 3. SAVE BEST MODEL
         if current_psnr > best_psnr:
             best_psnr = current_psnr
-            best_model_name = f"best_model_stage{stage}_epoch{epoch}.pth"
+            best_model_name = f"best_model_stage{stage}.pth"
             torch.save(model.state_dict(), best_model_name)
             print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f})")
 
@@ -321,7 +329,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | SSIM: {val_metrics['val/ssim']:.4f}")
 
         if (epoch + 1) >= 5 and current_psnr < 15.0:
-            print(f"Stop! At {epoch}: PSNR ({current_psnr:.3f}) < 15.0.")
+            print(f"Stop! At {epoch}: PSNR ({current_psnr:.3f}) < 15.0. Model is likely dying.")
             break
 
     print("Training completed!")
