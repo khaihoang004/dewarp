@@ -17,8 +17,9 @@ class CharbonnierLoss(nn.Module):
         loss = torch.sqrt((pred - target) ** 2 + self.eps ** 2)
         if reduction == 'mean':
             return torch.mean(loss)
-        elif reduction == 'none':
+        elif reduction == 'batchmean':
             return torch.mean(loss, dim=[1, 2, 3])
+        return loss
 
 
 class VGGPerceptualLoss(nn.Module):
@@ -66,17 +67,18 @@ class LABFrequencyColorLoss(nn.Module):
         self.weight_b = weight_b
         
         self.freq_sep = FFTSeparator(cutoff_freq=cutoff_freq)
-        self.l1_loss = nn.L1Loss(reduction='mean')
+        self.l1_loss = nn.L1Loss(reduction='none') 
 
     def _lab_loss(self, pred, target):
         pred_lab = kc.rgb_to_lab(pred)
         target_lab = kc.rgb_to_lab(target)
 
-        loss_l = self.l1_loss(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :])
-        loss_a = self.l1_loss(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :])
-        loss_b = self.l1_loss(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :])
+        loss_l = self.l1_loss(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :]).mean(dim=[1, 2, 3])
+        loss_a = self.l1_loss(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :]).mean(dim=[1, 2, 3])
+        loss_b = self.l1_loss(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :]).mean(dim=[1, 2, 3])
 
-        return (self.weight_l * loss_l) + (self.weight_a * loss_a) + (self.weight_b * loss_b)
+        total_lab = (self.weight_l * loss_l) + (self.weight_a * loss_a) + (self.weight_b * loss_b)
+        return total_lab / 100.0 
 
     def forward(self, pred, target):
         global_loss = self._lab_loss(pred, target)
@@ -172,8 +174,8 @@ class Stage1Loss(nn.Module):
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
         
-        low_loss = self.charbonnier(pred_low, target_low, reduction='none')
-        high_loss = self.charbonnier(pred_high, target_high, reduction='none')
+        low_loss = self.charbonnier(pred_low, target_low, reduction='batchmean')
+        high_loss = self.charbonnier(pred_high, target_high, reduction='batchmean')
         
         freq_loss = self.low_weight * low_loss + self.high_weight * high_loss
         perceptual = self.vgg_loss(pred, target)
@@ -198,7 +200,7 @@ class Stage1Loss(nn.Module):
             high_losses.append(high_t)
             color_losses.append(color_t)
 
-        rec_losses   = torch.stack(rec_losses, dim=0)   # [T, B, ...]
+        rec_losses   = torch.stack(rec_losses, dim=0)   # [T, B]
         low_losses   = torch.stack(low_losses, dim=0)
         high_losses  = torch.stack(high_losses, dim=0)
         color_losses = torch.stack(color_losses, dim=0)
@@ -206,7 +208,6 @@ class Stage1Loss(nn.Module):
         if halting_weights is not None:
             if halting_weights.dim() == 2:
                 q = halting_weights / (halting_weights.sum(dim=0, keepdim=True) + 1e-8)  # [T, B]
-                q = q.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)   # broadcast cho [T, B, 1,1,1]
             else:
                 q = halting_weights
 
