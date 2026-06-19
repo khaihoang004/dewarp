@@ -185,7 +185,7 @@ def train_one_epoch(
     return running_loss / total_steps, global_step
 
 
-# VALIDATION
+# VALIDATION (PHIÊN BẢN LOG THẲNG - SIÊU NHẸ RAM)
 @torch.no_grad()
 def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log_images=4):
     model.eval()
@@ -199,7 +199,6 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
     rmse_sum = 0.0
     total_images = 0
     
-    image_logs = {}
     logged_images_count = 0
 
     for i, batch in enumerate(tqdm(loader, desc="Validating Progressively")):
@@ -211,6 +210,7 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
 
         pred, inter_preds, halt_w, halt_logits, _ = outputs
         
+        # SỬA LỖI DATAPARALLEL (Giữ nguyên phần này)
         if halt_w is not None and halt_w.shape[0] != len(inter_preds):
             T = len(inter_preds)
             num_gpus = halt_w.shape[0] // T
@@ -230,7 +230,6 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
 
         for b in range(batch_size):
             g_img = gt[b:b+1]
-
             psnr_sum += compute_psnr(pred[b:b+1], g_img)
             ssim_sum += compute_ssim(pred[b:b+1], g_img)
             ms_ssim_sum += compute_ms_ssim(pred[b:b+1], g_img)
@@ -239,25 +238,24 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
             for t in range(T):
                 loop_psnr_sums[t] += compute_psnr(inter_preds[t][b:b+1], g_img)
                 loop_ssim_sums[t] += compute_ssim(inter_preds[t][b:b+1], g_img)
-
             total_images += 1
 
-        # Gom đủ ảnh thì mới ngừng gọi get_loop_steps_logs
-        if log_images and logged_images_count < max_log_images:
-            b_to_log = min(batch_size, max_log_images - logged_images_count)
-            
-            batch_logs = get_loop_steps_logs(
-                inp[:b_to_log], 
-                gt[:b_to_log], 
-                [p[:b_to_log] for p in inter_preds], 
-                halt_w[:, :b_to_log] if halt_w is not None else None, 
-                halt_logits[:, :b_to_log] if halt_logits is not None else None, 
-                max_samples=b_to_log,
-                start_idx=logged_images_count
-            )
-            image_logs.update(batch_logs)
-            logged_images_count += b_to_log
+            # LOG TRỰC TIẾP LÊN WANDB (KHÔNG GOM BIẾN)
+            if log_images and logged_images_count < max_log_images:
+                # Chỉ lấy dữ liệu của 1 ảnh tại index b
+                img_inp = inp[b:b+1]
+                img_pred = pred[b:b+1]
+                img_gt = g_img
+                
+                # Tạo log đơn lẻ
+                vis, metrics = make_vis(img_inp, img_pred, img_gt)
+                wandb.log({
+                    f"val/sample_{logged_images_count}_final": wandb.Image(vis, caption=f"PSNR={metrics['psnr']:.2f}")
+                }, step=global_step)
+                
+                logged_images_count += 1
 
+    # Tính toán metrics cuối cùng
     val_metrics = {
         "val/psnr": psnr_sum / total_images,
         "val/ssim": ssim_sum / total_images,
@@ -268,8 +266,6 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
     for t in range(T):
         val_metrics[f"val_loops/loop_{t+1}_psnr"] = loop_psnr_sums[t] / total_images
         val_metrics[f"val_loops/loop_{t+1}_ssim"] = loop_ssim_sums[t] / total_images
-
-    val_metrics.update(image_logs)
 
     return val_metrics
 
