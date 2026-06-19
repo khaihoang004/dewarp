@@ -144,6 +144,16 @@ def train_one_epoch(
 
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
             scaler.unscale_(optimizer)
+            total_norm = 0.0
+            param_count = 0
+
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_count += 1
+                    total_norm += p.grad.data.norm(2).item()
+
+            print(f"[GRAD] total_norm={total_norm:.6f} params_with_grad={param_count}")
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             first_param = next(model.parameters())
 
@@ -204,6 +214,8 @@ def train_one_epoch(
 # VALIDATION
 @torch.no_grad()
 def validate(model, loader, device, cfg, global_step=0, log_images=True):
+    params_hash = sum(p.sum().item() for p in model.parameters())
+    print(f"[VAL] model params hash: {params_hash:.4f}")
     model.eval()
 
     loop_psnr_sums = None
@@ -284,7 +296,8 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
         model.load_state_dict(checkpoint['model_state_dict'])
-        
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])   # ← thêm
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])   # ← thêm
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         start_epoch = checkpoint['epoch'] + 1
