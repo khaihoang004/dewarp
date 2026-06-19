@@ -319,8 +319,9 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         if current_psnr > best_psnr:
             best_psnr = current_psnr
             best_model_name = f"best_model_stage{stage}.pth"
-            torch.save(model.state_dict(), best_model_name)
-            print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f})")
+            
+            state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save(state_to_save, best_model_name)
 
         checkpoint_state = {
             'epoch': epoch,
