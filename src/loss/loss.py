@@ -14,7 +14,7 @@ class CharbonnierLoss(nn.Module):
         self.eps = eps
 
     def forward(self, pred, target, reduction='mean'):
-        loss = torch.sqrt((pred - target) ** 2 + self.eps ** 2)
+        loss = torch.sqrt(torch.clamp((pred - target) ** 2 + self.eps ** 2, min=1e-8))
         if reduction == 'mean':
             return torch.mean(loss)
         elif reduction == 'batchmean':
@@ -71,8 +71,11 @@ class LABFrequencyColorLoss(nn.Module):
         self.l1_loss = nn.L1Loss(reduction='none')
 
     def _lab_loss(self, pred, target):
-        pred_lab = kc.rgb_to_lab(pred)
-        target_lab = kc.rgb_to_lab(target)
+        pred_safe = pred.clamp(min=1e-5, max=1.0)
+        target_safe = target.clamp(min=1e-5, max=1.0)
+
+        pred_lab = kc.rgb_to_lab(pred_safe)
+        target_lab = kc.rgb_to_lab(target_safe)
 
         loss_l = self.l1_loss(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :]).mean(dim=[1, 2, 3])
         loss_a = self.l1_loss(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :]).mean(dim=[1, 2, 3])
