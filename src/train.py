@@ -60,7 +60,7 @@ def make_vis(inp, pred, gt):
     return vis, metrics
 
 
-def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logits, max_samples=4):
+def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logits, max_samples=4, start_idx=0):
     T = len(intermediate_preds)
     B = min(inp.size(0), max_samples)
     log_dict = {}
@@ -75,7 +75,7 @@ def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logit
             vis, metrics = make_vis(inp_b, pred_t, gt_b)
 
             exit_prob = torch.sigmoid(halt_logits[t][b]).mean().item() if halt_logits is not None else 0.0
-            act_w = halting_weights[t, b].item()
+            act_w = halting_weights[t, b].item() if halting_weights is not None else 0.0
 
             caption = (f"{t+1}/{T} | Exit: {exit_prob*100:.1f}% | "
                        f"Weight: {act_w:.3f} | PSNR={metrics['psnr']:.2f} | "
@@ -84,7 +84,8 @@ def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logit
 
             loop_images.append(wandb.Image(vis, caption=caption))
 
-        log_dict[f"val/sample_{b}_progress"] = loop_images
+        # Sử dụng start_idx để không bị ghi đè index trên WandB khi khác batch
+        log_dict[f"val/sample_{start_idx + b}_progress"] = loop_images
 
     return log_dict
 
@@ -145,48 +146,23 @@ def train_one_epoch(
 
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
             scaler.unscale_(optimizer)
-            total_norm = 0.0
-            param_count = 0
-
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_count += 1
-                    total_norm += p.grad.data.norm(2).item()
-
-            print(f"[GRAD] total_norm={total_norm:.6f} params_with_grad={param_count}")
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            first_param = next(model.parameters())
-
-            grad_mean = (
-                first_param.grad.abs().mean().item()
-                if first_param.grad is not None
-                else -1
-            )
-
-            weight_before = first_param.detach().mean().item()
-
-            print(
-                f"[DEBUG] grad={grad_mean:.8f} "
-                f"weight_before={weight_before:.8f}"
-            )
-
             scaler.step(optimizer)
             scaler.update()
-            weight_after = first_param.detach().mean().item()
-
-            print(
-                f"[DEBUG] weight_after={weight_after:.8f} "
-                f"delta={abs(weight_after-weight_before):.12f}"
-            )
             optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss_raw
 
-        T_steps = halting_weights.shape[0]
-        step_ids = torch.arange(1, T_steps + 1, device=halting_weights.device).float().view(-1, 1)  # [T, 1]
-        expected_steps = (step_ids * halting_weights).sum(dim=0).mean().item()
-        hard_steps = halting_weights.argmax(dim=0).float().mean().item() + 1
+        T_steps = halting_weights.shape[0] if halting_weights is not None else len(intermediate_preds)
+        
+        # Bọc an toàn nếu mô hình không dùng halting_weights (vd: test thử)
+        if halting_weights is not None:
+            step_ids = torch.arange(1, T_steps + 1, device=halting_weights.device).float().view(-1, 1)
+            expected_steps = (step_ids * halting_weights).sum(dim=0).mean().item()
+            hard_steps = halting_weights.argmax(dim=0).float().mean().item() + 1
+        else:
+            expected_steps = T_steps
+            hard_steps = T_steps
 
         if batch_idx == total_steps - 1:
             wandb.log({
@@ -205,7 +181,7 @@ def train_one_epoch(
 
 # VALIDATION
 @torch.no_grad()
-def validate(model, loader, device, cfg, global_step=0, log_images=True):
+def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log_images=4):
     model.eval()
 
     loop_psnr_sums = None
@@ -216,7 +192,9 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True):
     ms_ssim_sum = 0.0
     rmse_sum = 0.0
     total_images = 0
+    
     image_logs = {}
+    logged_images_count = 0
 
     for i, batch in enumerate(tqdm(loader, desc="Validating Progressively")):
         inp = batch["inp"].to(device)
@@ -226,11 +204,7 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True):
             outputs = model(inp, return_all=True)
 
         pred, inter_preds, halt_w, halt_logits, _ = outputs
-        if i == 0:
-            print(
-                f"[VAL] pred mean={pred.mean().item():.6f} "
-                f"std={pred.std().item():.6f}"
-            )
+        
         T = len(inter_preds)
         batch_size = inp.size(0)
 
@@ -252,8 +226,21 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True):
 
             total_images += 1
 
-        if i == 0 and log_images:
-            image_logs = get_loop_steps_logs(inp, gt, inter_preds, halt_w, halt_logits)
+        # Gom đủ ảnh thì mới ngừng gọi get_loop_steps_logs
+        if log_images and logged_images_count < max_log_images:
+            b_to_log = min(batch_size, max_log_images - logged_images_count)
+            
+            batch_logs = get_loop_steps_logs(
+                inp[:b_to_log], 
+                gt[:b_to_log], 
+                [p[:b_to_log] for p in inter_preds], 
+                halt_w[:, :b_to_log] if halt_w is not None else None, 
+                halt_logits[:, :b_to_log] if halt_logits is not None else None, 
+                max_samples=b_to_log,
+                start_idx=logged_images_count
+            )
+            image_logs.update(batch_logs)
+            logged_images_count += b_to_log
 
     val_metrics = {
         "val/psnr": psnr_sum / total_images,
@@ -278,7 +265,6 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
     global_step = 0
     start_epoch = 0
 
-    # 1. RELOAD CHECKPOINT
     checkpoint_path = getattr(cfg, "resume_checkpoint", None)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -301,7 +287,6 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
     accumulation_steps = getattr(cfg, "accumulation_steps", 4)
     max_steps_per_epoch = getattr(cfg, "max_steps_per_epoch", 500)
 
-    # 2. TRAIN
     for epoch in range(start_epoch, cfg.epochs):
         train_loss, global_step = train_one_epoch(
             model=model,
@@ -331,14 +316,12 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
 
         current_psnr = val_metrics["val/psnr"]
 
-        # 3. SAVE BEST MODEL
         if current_psnr > best_psnr:
             best_psnr = current_psnr
             best_model_name = f"best_model_stage{stage}.pth"
             torch.save(model.state_dict(), best_model_name)
             print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f})")
 
-        # 4. SAVE CHECKPOINT EACH EPOCH
         checkpoint_state = {
             'epoch': epoch,
             'global_step': global_step,
