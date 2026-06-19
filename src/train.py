@@ -1,6 +1,7 @@
 import os
 import random
 import torch
+import torch.nn as nn
 import wandb
 from tqdm import tqdm
 import numpy as np
@@ -122,6 +123,12 @@ def train_one_epoch(
             outputs = model(inp, return_all=True)
             pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
 
+            if halting_weights is not None and halting_weights.shape[0] != len(intermediate_preds):
+                T = len(intermediate_preds)
+                num_gpus = halting_weights.shape[0] // T
+                hw = halting_weights.view(num_gpus, T, -1).permute(1, 0, 2)
+                halting_weights = hw.reshape(T, -1)
+
             if stage == 1:
                 loss, loss_dict = criterion(
                     target=gt,
@@ -155,7 +162,6 @@ def train_one_epoch(
 
         T_steps = halting_weights.shape[0] if halting_weights is not None else len(intermediate_preds)
         
-        # Bọc an toàn nếu mô hình không dùng halting_weights (vd: test thử)
         if halting_weights is not None:
             step_ids = torch.arange(1, T_steps + 1, device=halting_weights.device).float().view(-1, 1)
             expected_steps = (step_ids * halting_weights).sum(dim=0).mean().item()
@@ -204,6 +210,16 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
             outputs = model(inp, return_all=True)
 
         pred, inter_preds, halt_w, halt_logits, _ = outputs
+        
+        if halt_w is not None and halt_w.shape[0] != len(inter_preds):
+            T = len(inter_preds)
+            num_gpus = halt_w.shape[0] // T
+            hw = halt_w.view(num_gpus, T, -1).permute(1, 0, 2)
+            halt_w = hw.reshape(T, -1)
+            
+            if halt_logits is not None:
+                hl = halt_logits.view(num_gpus, T, -1).permute(1, 0, 2)
+                halt_logits = hl.reshape(T, -1)
         
         T = len(inter_preds)
         batch_size = inp.size(0)
@@ -316,17 +332,18 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
 
         current_psnr = val_metrics["val/psnr"]
 
+        state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
         if current_psnr > best_psnr:
             best_psnr = current_psnr
             best_model_name = f"best_model_stage{stage}.pth"
-            
-            state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save(state_to_save, best_model_name)
+            print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f})")
 
         checkpoint_state = {
             'epoch': epoch,
             'global_step': global_step,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': state_to_save,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
