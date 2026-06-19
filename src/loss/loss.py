@@ -264,7 +264,7 @@ class Stage2Loss(nn.Module):
         self.charbonnier = CharbonnierLoss()
 
     def reconstruction_loss(self, pred, target):
-        charb = self.charbonnier(pred, target, reduction='none')
+        charb = self.charbonnier(pred, target, reduction='batchmean') 
         pred_clamp = torch.clamp(pred, 0.0, 1.0)
         ssim_val = ssim(pred_clamp, target, data_range=1.0, size_average=False)
         ssim_loss = 1.0 - ssim_val
