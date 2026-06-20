@@ -289,7 +289,7 @@ class DecoderStage(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        self.norm_out = LayerNorm2d(out_channels)
+        self.norm_out = RMSNorm2d(out_channels)
 
     def forward(self, x, skip_feat):
         x = self.expand_channels(x)
