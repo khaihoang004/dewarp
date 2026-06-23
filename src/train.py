@@ -131,6 +131,7 @@ def train_one_epoch(
 
             if stage == 1:
                 loss, loss_dict = criterion(
+                    input_img=inp,
                     target=gt,
                     final_pred=pred,
                     intermediate_preds=intermediate_preds,
