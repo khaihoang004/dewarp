@@ -58,54 +58,6 @@ class VGGPerceptualLoss(nn.Module):
 
         return loss
 
-
-class LABFrequencyColorLoss(nn.Module):
-    def __init__(self, weight_low_freq=1.8, weight_l=1.0, weight_a=2.0, weight_b=4.0, cutoff_freq=20):
-        super().__init__()
-        self.weight_low_freq = weight_low_freq
-        self.weight_l = weight_l
-        self.weight_a = weight_a
-        self.weight_b = weight_b
-
-        self.freq_sep = FFTSeparator(cutoff_freq=cutoff_freq)
-        self.l1_loss = nn.L1Loss(reduction='none')
-
-    def _lab_loss(self, pred, target):
-        pred_safe = pred.clamp(min=1e-5, max=1.0)
-        target_safe = target.clamp(min=1e-5, max=1.0)
-
-        pred_lab = kc.rgb_to_lab(pred_safe)
-        target_lab = kc.rgb_to_lab(target_safe)
-
-        loss_l = self.l1_loss(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :]).mean(dim=[1, 2, 3])
-        loss_a = self.l1_loss(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :]).mean(dim=[1, 2, 3])
-        loss_b = self.l1_loss(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :]).mean(dim=[1, 2, 3])
-
-        total_lab = (self.weight_l * loss_l) + (self.weight_a * loss_a) + (self.weight_b * loss_b)
-        return total_lab / 100.0
-
-    def forward(self, pred, target):
-        global_loss = self._lab_loss(pred, target)
-
-        pred_low, _ = self.freq_sep(pred)
-        target_low, _ = self.freq_sep(target)
-
-        low_loss = self._lab_loss(pred_low, target_low)
-
-        total_loss = global_loss + self.weight_low_freq * low_loss
-        return total_loss
-
-class SpatialConsistencyLoss(nn.Module):
-    def __init__(self, weight=0.8, kernel_size=7):
-        super().__init__()
-        self.weight = weight
-        self.pool = nn.AvgPool2d(kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-
-    def forward(self, pred):
-        smoothed = self.pool(pred)
-        loss = F.l1_loss(pred, smoothed, reduction='mean')
-        return self.weight * loss
-
 class FrequencySeparator(nn.Module):
     def __init__(self, kernel_size=5, sigma=1.0, channels=3):
         super().__init__()
@@ -159,6 +111,37 @@ class FFTSeparator(nn.Module):
         return low_freq, high_freq
 
 
+class LABColorLoss(nn.Module):
+    def __init__(self, weight_l=1.0, weight_a=1.5, weight_b=2.0, alpha=10.0):
+        super().__init__()
+        self.weight_l = weight_l
+        self.weight_a = weight_a
+        self.weight_b = weight_b
+        
+        self.alpha = alpha 
+        self.l1 = nn.L1Loss(reduction='none')
+
+    def _to_lab(self, img):
+        return kc.rgb_to_lab(img.clamp(min=1e-5, max=1.0))
+
+    def forward(self, pred, input_img, target):
+        pred_lab = self._to_lab(pred)
+        input_lab = self._to_lab(input_img)
+        target_lab = self._to_lab(target)
+
+        diff_lab = torch.abs(input_lab - target_lab).mean(dim=1, keepdim=True) / 100.0
+
+        focus_weight = 1.0 - torch.exp(-self.alpha * diff_lab).detach()
+
+        loss_l = (self.l1(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :]) * focus_weight).mean()
+        loss_a = (self.l1(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :]) * focus_weight).mean()
+        loss_b = (self.l1(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :]) * focus_weight).mean()
+
+        total_loss = (self.weight_l * loss_l + self.weight_a * loss_a + self.weight_b * loss_b) / 100.0
+
+        return total_loss
+
+
 class Stage1Loss(nn.Module):
     def __init__(
         self,
@@ -167,8 +150,6 @@ class Stage1Loss(nn.Module):
         high_weight=0.65,
         perceptual_weight=0.035,
         color_weight=0.45,
-        color_low_freq_weight=0.35,
-        spatial_weight=0.15,
         refine_weight=2.0,
         kl_weight=0.06,
     ):
@@ -177,10 +158,7 @@ class Stage1Loss(nn.Module):
         self.low_weight = low_weight
         self.high_weight = high_weight
         self.perceptual_weight = perceptual_weight
-        
         self.color_weight = color_weight
-        self.spatial_weight = spatial_weight
-        
         self.refine_weight = refine_weight
         self.kl_weight = kl_weight
 
@@ -188,17 +166,14 @@ class Stage1Loss(nn.Module):
         self.freq_separator = FFTSeparator(cutoff_freq=25)
         self.vgg_loss = VGGPerceptualLoss()
         
-        self.color_loss_fn = LABFrequencyColorLoss(
-            weight_low_freq=color_low_freq_weight,
+        self.focused_color_loss_fn = LABColorLoss(
             weight_l=1.0,
-            weight_a=2.0,
-            weight_b=5.0 
+            weight_a=1.5,
+            weight_b=2.0,
+            alpha=10.0
         )
-        
-        # Thêm Spatial Loss để làm phẳng nền, dùng kernel=5 bảo vệ chữ
-        self.spatial_loss_fn = SpatialConsistencyLoss(weight=1.0, kernel_size=5)
 
-    def reconstruction_loss(self, pred, target):
+    def reconstruction_loss(self, pred, input_img, target):
         pred_low, pred_high = self.freq_separator(pred)
         target_low, target_high = self.freq_separator(target)
 
@@ -207,39 +182,34 @@ class Stage1Loss(nn.Module):
         high_loss = self.charbonnier(pred_high, target_high, reduction='batchmean')
         freq_loss = self.low_weight * low_loss + self.high_weight * high_loss
         
-        # 2. (VGG)
+        # 2. VGG
         perceptual = self.vgg_loss(pred, target)
-        
         structural_loss = freq_loss + self.perceptual_weight * perceptual 
         
-        # 3. Color and Spatial
-        color_loss = self.color_loss_fn(pred, target)
-        spatial_loss = self.spatial_loss_fn(pred)
+        # 3.Color Loss
+        color_loss = self.focused_color_loss_fn(pred, input_img, target)
 
-        return structural_loss, low_loss, high_loss, color_loss, spatial_loss
+        return structural_loss, low_loss, high_loss, color_loss
 
-    def forward(self, target, final_pred, intermediate_preds, halting_weights=None, **kwargs):
+    def forward(self, input_img, target, final_pred, intermediate_preds, halting_weights=None, **kwargs):
         T = len(intermediate_preds)
 
         rec_losses = []
         low_losses = []
         high_losses = []
         color_losses = []
-        spatial_losses = []
 
         for pred_t in intermediate_preds:
-            rec_t, low_t, high_t, color_t, spatial_t = self.reconstruction_loss(pred_t, target)
+            rec_t, low_t, high_t, color_t = self.reconstruction_loss(pred_t, input_img, target)
             rec_losses.append(rec_t)
             low_losses.append(low_t)
             high_losses.append(high_t)
             color_losses.append(color_t)
-            spatial_losses.append(spatial_t)
 
         rec_losses     = torch.stack(rec_losses, dim=0)   # [T, B]
         low_losses     = torch.stack(low_losses, dim=0)
         high_losses    = torch.stack(high_losses, dim=0)
         color_losses   = torch.stack(color_losses, dim=0)
-        spatial_losses = torch.stack(spatial_losses, dim=0)
 
         if halting_weights is not None:
             if halting_weights.dim() == 2:
@@ -251,13 +221,11 @@ class Stage1Loss(nn.Module):
             weighted_low     = (q * low_losses).sum(dim=0).mean()
             weighted_high    = (q * high_losses).sum(dim=0).mean()
             weighted_color   = (q * color_losses).sum(dim=0).mean()
-            weighted_spatial = (q * spatial_losses).sum(dim=0).mean()
         else:
             weighted_rec     = rec_losses.mean()
             weighted_low     = low_losses.mean()
             weighted_high    = high_losses.mean()
             weighted_color   = color_losses.mean()
-            weighted_spatial = spatial_losses.mean()
 
         refine_loss = 0.0
         if T > 1 and self.refine_weight > 0:
@@ -276,7 +244,6 @@ class Stage1Loss(nn.Module):
         total_loss = (
             self.trajectory_weight * weighted_rec +
             self.color_weight * weighted_color +
-            self.spatial_weight * weighted_spatial +
             self.refine_weight * refine_loss +
             self.kl_weight * kl_loss
         )
@@ -287,7 +254,6 @@ class Stage1Loss(nn.Module):
             "loss/freq_low": weighted_low.item(),
             "loss/freq_high": weighted_high.item(),
             "loss/color_lab": weighted_color.item(),
-            "loss/spatial": weighted_spatial.item(),
             "loss/refine": float(refine_loss) if isinstance(refine_loss, float) else refine_loss.item(),
             "loss/kl": float(kl_loss) if isinstance(kl_loss, float) else kl_loss.item(),
         }
