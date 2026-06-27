@@ -51,7 +51,7 @@ class EncoderStage(nn.Module):
         self.act = nn.GELU()
         
         self.blocks = nn.ModuleList([
-            LocalStripBlock(out_channels, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
+            LocalStripBlock(out_channels, deploy=deploy) for _ in range(num_blocks)
         ])
         
         self.norm_feat = RMSNorm2d(out_channels)
@@ -78,7 +78,7 @@ class DecoderStage(nn.Module):
         self.gate_conv = nn.Conv2d(in_channels, skip_channels, kernel_size=1)
         self.conv = RepConv3(in_channels + skip_channels, out_channels, deploy=deploy)
         self.blocks = nn.ModuleList([
-            LocalStripBlock(out_channels, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
+            LocalStripBlock(out_channels, deploy=deploy) for _ in range(num_blocks)
         ])
         self.norm_out = RMSNorm2d(out_channels)
 
