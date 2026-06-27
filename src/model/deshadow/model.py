@@ -55,7 +55,7 @@ class TextureRecoveryModule(nn.Module):
         return self.proj(out)
 
 class DocDeshadowNet(nn.Module):
-    def __init__(self, base_dim=32, max_loops=4, num_heads=8, enc_blocks=[1, 1, 2], dec_blocks=[1, 1, 2], deploy=False):
+    def __init__(self, base_dim=16, max_loops=4, num_heads=8, enc_blocks=[1, 1, 2], dec_blocks=[1, 1, 2], deploy=False):
         super().__init__()
         self.base_dim = base_dim
         
