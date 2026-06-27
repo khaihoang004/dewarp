@@ -23,7 +23,7 @@ def max_abs_error(a, b):
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
-def benchmark_latency(model, dummy_input, device, warmup=10, iters=50):
+def benchmark_latency(model, dummy_input, device, warmup=5, iters=20):
     model = model.to(device)
     dummy_input = dummy_input.to(device)
     model.eval()
