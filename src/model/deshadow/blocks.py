@@ -7,26 +7,6 @@ from src.model.modules.attention import DocumentStripAttention, RepAttn
 from src.model.modules.repconv import RepConv3
 
 
-class RepDATBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, deploy=False):
-        super().__init__()
-        self.norm1 = RMSNorm2d(dim)
-        self.strip_attn = DocumentStripAttention(dim)
-        self.rep_attn = RepAttn(dim, num_heads=num_heads, deploy=deploy)
-        self.scale1 = LayerScale(dim, init_value=0.5)
-        
-        self.norm2 = RMSNorm2d(dim)
-        self.ffn = SwiGLU_FFN(dim)
-        self.scale2 = LayerScale(dim, init_value=0.5)
-
-    def forward(self, x):
-        nx = self.norm1(x)
-        attn_out = self.strip_attn(nx) + self.rep_attn(nx)
-        x = x + self.scale1(attn_out)
-        
-        x = x + self.scale2(self.ffn(self.norm2(x)))
-        return x
-
 class LocalStripBlock(nn.Module):
     def __init__(self, dim, deploy=False):
         super().__init__()
@@ -94,29 +74,25 @@ class DecoderStage(nn.Module):
         return self.norm_out(x)
 
 
-class BottleneckLayer(nn.Module):
-    def __init__(self, dim, num_blocks=1, num_heads=8, deploy=False):
+class RepAttnBottleneckLayer(nn.Module):
+    """Thay thế LocalStripBlock bằng RepAttn + FFN"""
+    def __init__(self, dim, num_heads=8, deploy=False):
         super().__init__()
-        
-        self.blocks = nn.ModuleList([
-            LocalStripBlock(dim, deploy=deploy) for _ in range(num_blocks)
-        ])
+        self.norm1 = RMSNorm2d(dim)
+        self.attn = RepAttn(dim, num_heads=num_heads, deploy=deploy)
+        self.norm2 = RMSNorm2d(dim)
+        self.ffn = SwiGLU_FFN(dim)
 
+        # Skip-connection xuyên thời gian với x_orig
         self.fusion = nn.Sequential(
             nn.Conv2d(dim * 2, dim, kernel_size=1),
             nn.GELU(),
-            RepConv3(dim, dim, deploy=deploy), 
+            RepConv3(dim, dim, deploy=deploy),
             nn.GELU(),
-        )
-
-        self.exit_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, dim // 4, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(dim // 4, 1, kernel_size=1),
         )
 
     def forward(self, x, x_orig, step_embed=None):
+        # 1. Dung hợp với input gốc của bottleneck
         concat = torch.cat([x, x_orig], dim=1)
         fused = self.fusion(concat)
         
@@ -124,82 +100,107 @@ class BottleneckLayer(nn.Module):
             fused = fused + step_embed
         x = x + fused
 
-        for block in self.blocks:
-            x = block(x)
+        # 2. Xử lý qua RepAttn và FFN (Pre-Norm style)
+        nx = self.norm1(x)
+        x = x + self.attn(nx)
+        
+        nx2 = self.norm2(x)
+        x = x + self.ffn(nx2)
+        
+        return x
 
-        exit_logit = self.exit_head(x).view(-1)
-        exit_prob = torch.sigmoid(exit_logit)
 
-        return x, exit_logit, exit_prob
-
-class AdaptiveLoopedBottleneck(nn.Module):
-    def __init__(self, dim, max_loops=6, num_heads=8, deploy=False):
+class EntropyLoopedBottleneck(nn.Module):
+    """Cơ chế Vòng lặp dừng động dựa trên Shannon Entropy của LoopViT"""
+    def __init__(self, dim, num_classes, max_loops=6, num_heads=8, deploy=False):
         super().__init__()
         self.max_loops = max_loops
-        
-        self.layer = BottleneckLayer(dim, num_heads=num_heads, deploy=deploy)
+        self.layer = RepAttnBottleneckLayer(dim, num_heads=num_heads, deploy=deploy)
 
+        # Step embeddings để phân biệt các bước (tùy chọn nhưng khuyến nghị)
         self.step_embeddings = nn.Parameter(torch.zeros(max_loops, 1, dim, 1, 1))
         nn.init.normal_(self.step_embeddings, std=0.02)
 
-    def forward(self, x, halt_threshold=0.85, return_all=False):
+        # Khối Auxiliary Head để ánh xạ feature map về phân bố xác suất (Predictive Space)
+        # Bắt buộc phải có để đo Entropy chuẩn theo LoopViT
+        self.pred_head = nn.Conv2d(dim, num_classes, kernel_size=1)
+
+    def compute_entropy(self, state):
+        """
+        Tính average pixel-wise Shannon entropy.
+        Eq (11) LoopViT: H_t = - 1/N * sum( P * log(P) )
+        """
+        logits = self.pred_head(state) # (B, num_classes, H, W)
+        probs = F.softmax(logits, dim=1)
+        log_probs = F.log_softmax(logits, dim=1)
+        
+        # (B, H, W) -> Trung bình qua các điểm ảnh H, W để ra (B,)
+        entropy = -(probs * log_probs).sum(dim=1).mean(dim=[1, 2])
+        return entropy
+
+    def forward(self, x, tau=0.05, return_all=False):
         B = x.shape[0]
         device = x.device
-        if self.training or return_all:
-            x_orig = x.clone()
-        else:
-            x_orig = x.detach()
+        
+        # Khi training, luôn giữ computational graph của x_orig
+        x_orig = x.clone() if (self.training or return_all) else x.detach()
 
-        if self.training or return_all:
-            states = []
-            exit_probs_list = []
-            logits_list = []
+        state = x
+        states = []
+        entropies_list = []
 
-            state = x
-            for t in range(self.max_loops):
-                step_embed = self.step_embeddings[t]
-                state, g_logit, e_prob = self.layer(state, x_orig, step_embed)
+        # Các biến quản lý Early Exit cho Inference
+        finished_mask = torch.zeros(B, dtype=torch.bool, device=device)
+        cached_final = torch.zeros_like(x)
+        exit_steps = torch.full((B,), self.max_loops, dtype=torch.long, device=device)
 
+        for t in range(self.max_loops):
+            step_embed = self.step_embeddings[t]
+
+            # 1. Cập nhật state qua RepAttn
+            state = self.layer(state, x_orig, step_embed)
+            
+            # 2. Tính Entropy để đo độ "kết tinh" (Crystallization)
+            entropy = self.compute_entropy(state)
+
+            if self.training or return_all:
                 states.append(state)
-                exit_probs_list.append(e_prob)
-                logits_list.append(g_logit)
+                entropies_list.append(entropy)
 
-            exit_probs = torch.stack(exit_probs_list, dim=0)   # (T, B)
-            gate_logits = torch.stack(logits_list, dim=0)      # (T, B)
+            # 3. Dynamic Hard-Exit (Chỉ kích hoạt khi Inference)
+            if not self.training:
+                exit_now = (entropy < tau) & (~finished_mask)
 
-            survival = torch.ones(B, device=device)
-            halting_weights = torch.zeros_like(exit_probs)     # (T, B)
+                if exit_now.any():
+                    # Lưu lại state cho các sample đã thỏa mãn điều kiện dừng
+                    cached_final = torch.where(
+                        exit_now.view(B, 1, 1, 1), 
+                        state, 
+                        cached_final
+                    )
+                    exit_steps[exit_now] = t + 1
+                    finished_mask = finished_mask | exit_now
 
-            for t in range(self.max_loops):
-                if t < self.max_loops - 1:
-                    p_t = exit_probs[t] * survival
-                    halting_weights[t] = p_t
-                    survival = survival * (1.0 - exit_probs[t]).clamp(min=1e-6)
-                else:
-                    halting_weights[t] = survival
+                state = torch.where(
+                    finished_mask.view(B, 1, 1, 1),
+                    cached_final,
+                    state
+                )
 
-            final_state = torch.zeros_like(states[0])
-            for t in range(self.max_loops):
-                w = halting_weights[t].view(B, 1, 1, 1)
-                final_state = final_state + w * states[t]
+                if finished_mask.all():
+                    break
 
+        if self.training:
+            final_state = state
+            
             if return_all:
-                return final_state, states, halting_weights, gate_logits, exit_probs
+                return final_state, states, entropies_list
             return final_state
 
         else:
-            state = x
-            cumulative = torch.zeros(B, device=device)
-
-            for t in range(self.max_loops):
-                step_embed = self.step_embeddings[t]
-
-                state, _, lambda_t = self.layer(state, x_orig, step_embed)
-
-                survival = (1.0 - cumulative).clamp(min=1e-6)
-                cumulative = torch.clamp(cumulative + lambda_t * survival, min=0.0, max=1.0)
-
-                if (cumulative >= halt_threshold).all():
-                    break
-
-            return state
+            final_state = torch.where(
+                finished_mask.view(B, 1, 1, 1), 
+                cached_final, 
+                state
+            )
+            return final_state, exit_steps

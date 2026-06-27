@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.modules.repconv import RepConv3, RepConv7
-from src.model.deshadow.blocks import EncoderStage, DecoderStage, AdaptiveLoopedBottleneck
+from src.model.deshadow.blocks import EncoderStage, DecoderStage, EntropyLoopedBottleneck
 
 
 class ShallowExtractor(nn.Module):
@@ -68,7 +68,13 @@ class DocDeshadowNet(nn.Module):
         self.enc2 = EncoderStage(base_dim * 2, base_dim * 2, enc_blocks[1], num_heads, deploy)
         self.enc3 = EncoderStage(base_dim * 4, base_dim * 4, enc_blocks[2], num_heads, deploy)
 
-        self.bottleneck = AdaptiveLoopedBottleneck(dim=base_dim * 4, max_loops=max_loops, num_heads=num_heads, deploy=deploy)
+        self.bottleneck = EntropyLoopedBottleneck(
+            dim=base_dim * 4, 
+            num_classes=2, 
+            max_loops=max_loops, 
+            num_heads=num_heads, 
+            deploy=deploy
+        )
 
         self.dec3 = DecoderStage(base_dim * 4, base_dim * 4, base_dim * 2, dec_blocks[2], num_heads, deploy)
         self.dec2 = DecoderStage(base_dim * 2, base_dim * 2, base_dim, dec_blocks[1], num_heads, deploy)
@@ -81,7 +87,7 @@ class DocDeshadowNet(nn.Module):
             nn.Conv2d(base_dim, 3, kernel_size=3, padding=1)
         )
 
-    def forward(self, x, halt_threshold=0.80, return_all=False):
+    def forward(self, x, tau=0.05, return_all=False):
         x_ori = x.clone()
         
         # 1. Multi-scale Inputs
@@ -98,13 +104,11 @@ class DocDeshadowNet(nn.Module):
         feat_L3 = self.shallow_L3(x_L3)
         skip3, down3 = self.enc3(torch.cat([down2, feat_L3], dim=1))
 
-        # 3. Looped Bottleneck
+        # 3. Looped Bottleneck (LoopViT Strategy)
         if self.training or return_all:
-            b_out, layer_outputs, halting_weights, gate_logits, exit_probs = self.bottleneck(
-                down3, halt_threshold=halt_threshold, return_all=True
-            )
+            b_out, layer_outputs, entropies = self.bottleneck(down3, tau=tau, return_all=True)
         else:
-            b_out = self.bottleneck(down3, halt_threshold=halt_threshold)
+            b_out, exit_steps = self.bottleneck(down3, tau=tau)
 
         # 4. Decode
         d3 = self.dec3(b_out, skip3)
@@ -118,6 +122,7 @@ class DocDeshadowNet(nn.Module):
         if not self.training:
             output = torch.clamp(output, 0.0, 1.0)
 
+        # 6. Trả về thông tin phụ (dùng cho huấn luyện, debug)
         if return_all:
             intermediate_preds = []
             for state in layer_outputs:
@@ -129,7 +134,7 @@ class DocDeshadowNet(nn.Module):
                 pred_t = x_ori + res_t
                 intermediate_preds.append(pred_t)
                 
-            return output, intermediate_preds, halting_weights, gate_logits, exit_probs
+            return output, intermediate_preds, entropies
 
         return output
 
