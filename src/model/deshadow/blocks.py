@@ -99,7 +99,7 @@ class BottleneckLayer(nn.Module):
         super().__init__()
         
         self.blocks = nn.ModuleList([
-            RepDATBlock(dim, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
+            LocalStripBlock(dim, deploy=deploy) for _ in range(num_blocks)
         ])
 
         self.fusion = nn.Sequential(
