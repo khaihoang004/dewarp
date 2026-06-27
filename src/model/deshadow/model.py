@@ -119,7 +119,17 @@ class DocDeshadowNet(nn.Module):
             output = torch.clamp(output, 0.0, 1.0)
 
         if return_all:
-            return output, layer_outputs, halting_weights, gate_logits, exit_probs
+            intermediate_preds = []
+            for state in layer_outputs:
+                d3_t = self.dec3(state, skip3)
+                d2_t = self.dec2(d3_t, skip2)
+                d1_t = self.dec1(d2_t, skip1)
+                res_t = self.final_head(d1_t)
+                
+                pred_t = x_ori + res_t
+                intermediate_preds.append(pred_t)
+                
+            return output, intermediate_preds, halting_weights, gate_logits, exit_probs
 
         return output
 
