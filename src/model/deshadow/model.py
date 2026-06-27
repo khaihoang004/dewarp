@@ -125,7 +125,12 @@ class DocDeshadowNet(nn.Module):
         # 6. Trả về thông tin phụ (dùng cho huấn luyện, debug)
         if return_all:
             intermediate_preds = []
+            bottleneck_logits_list = []
+            
             for state in layer_outputs:
+                logits = self.bottleneck.pred_head(state)
+                bottleneck_logits_list.append(logits)
+                
                 d3_t = self.dec3(state, skip3)
                 d2_t = self.dec2(d3_t, skip2)
                 d1_t = self.dec1(d2_t, skip1)
@@ -134,7 +139,7 @@ class DocDeshadowNet(nn.Module):
                 pred_t = x_ori + res_t
                 intermediate_preds.append(pred_t)
                 
-            return output, intermediate_preds, entropies
+            return output, intermediate_preds, bottleneck_logits_list
 
         return output
 
