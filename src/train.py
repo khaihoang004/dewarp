@@ -74,22 +74,20 @@ def train_one_epoch(
             inp, gt = aug(inp, gt)
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
-            # BẮT BUỘC return_all=True khi Training để chạy đủ T bước
-            outputs, intermediate_preds, bottleneck_logits_list = model(inp, tau=0.05, return_all=True)
 
-            # Truyền List vào Criterion
+            out = model(inp, return_all=True)
+
             loss, loss_dict = criterion(
-                input_img=inp,
+                final_pred=out["final"],
                 target=gt,
-                intermediate_preds=intermediate_preds,
-                bottleneck_logits_list=bottleneck_logits_list
+                intermediate_preds=out.get("intermediate", None)
             )
 
         loss_raw = loss.item()
-        loss = loss / accumulation_steps
-        scaler.scale(loss).backward()
+        loss_scaled = loss / accumulation_steps
 
-        # Cập nhật Gradient
+        scaler.scale(loss_scaled).backward()
+
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -99,12 +97,11 @@ def train_one_epoch(
 
         running_loss += loss_raw
 
-        # Log WandB
         if batch_idx == total_steps - 1:
             wandb.log({
                 "train/loss": loss_raw,
                 "lr": optimizer.param_groups[0]["lr"],
-                **{f"train/{k}": (v.item() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
+                **{f"train/{k}": v for k, v in loss_dict.items()}
             }, step=global_step)
 
         global_step += 1
@@ -120,7 +117,7 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
 
     psnr_sum = ssim_sum = ms_ssim_sum = rmse_sum = 0.0
     total_images = 0
-    total_exit_steps = 0.0  # Biến mới để theo dõi LoopViT tiết kiệm được bao nhiêu vòng lặp
+    total_exit_steps = 0.0
     logged_images_count = 0
 
     for i, batch in enumerate(tqdm(loader, desc="Validating")):
@@ -128,45 +125,46 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
         gt = batch["gt"].to(device)
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
-            # Inference Mode: return_all=False để kích hoạt Entropy Hard-Exit
-            pred, exit_steps = model(inp, tau=0.05, return_all=False)
-            
+
+            pred = model(inp, return_all=False)   # 🔥 FIX
+
         batch_size = inp.size(0)
         total_images += batch_size
-        
-        # Cộng dồn số bước đã exit để tính trung bình
-        total_exit_steps += exit_steps.float().sum().item()
+
+        # fallback exit step (safe version)
+        exit_steps = torch.full(
+            (batch_size,),
+            model.bottleneck.max_loops,
+            device=device
+        )
+
+        total_exit_steps += exit_steps.sum().item()
 
         for b in range(batch_size):
-            g_img = gt[b:b+1]
-            pred_img = pred[b:b+1]
-            
-            psnr_sum += compute_psnr(pred_img, g_img)
-            ssim_sum += compute_ssim(pred_img, g_img)
-            ms_ssim_sum += compute_ms_ssim(pred_img, g_img)
-            rmse_sum += compute_rmse(pred_img, g_img)
+            psnr_sum += compute_psnr(pred[b:b+1], gt[b:b+1])
+            ssim_sum += compute_ssim(pred[b:b+1], gt[b:b+1])
+            ms_ssim_sum += compute_ms_ssim(pred[b:b+1], gt[b:b+1])
+            rmse_sum += compute_rmse(pred[b:b+1], gt[b:b+1])
 
-            # Log ảnh mẫu trực tiếp lên WandB
             if log_images and logged_images_count < max_log_images:
-                vis, metrics = make_vis(inp[b:b+1], pred_img, g_img)
-                # Kèm theo số vòng lặp thực tế mà sample này cần
-                caption = f"PSNR={metrics['psnr']:.2f} | Exit at Loop: {exit_steps[b].item()}"
-                
+                vis, metrics = make_vis(inp[b:b+1], pred[b:b+1], gt[b:b+1])
+
                 wandb.log({
-                    f"val/sample_{logged_images_count}": wandb.Image(vis, caption=caption)
+                    f"val/sample_{logged_images_count}": wandb.Image(
+                        vis,
+                        caption=f"PSNR={metrics['psnr']:.2f}"
+                    )
                 }, step=global_step)
+
                 logged_images_count += 1
 
-    # Tính toán metrics cuối cùng
-    val_metrics = {
+    return {
         "val/psnr": psnr_sum / total_images,
         "val/ssim": ssim_sum / total_images,
         "val/ms_ssim": ms_ssim_sum / total_images,
         "val/rmse": rmse_sum / total_images,
-        "val/avg_exit_steps": total_exit_steps / total_images, # <--- METRIC QUAN TRỌNG NHẤT!
+        "val/avg_exit_steps": total_exit_steps / total_images,
     }
-
-    return val_metrics
 
 
 # --- 3. MAIN TRAINING LOOP ---
