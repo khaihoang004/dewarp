@@ -1,5 +1,4 @@
 import os
-import random
 import torch
 import torch.nn as nn
 import wandb
@@ -7,9 +6,8 @@ from tqdm import tqdm
 import numpy as np
 from torch.amp import autocast, GradScaler
 from pytorch_msssim import ms_ssim, ssim
-import glob
 
-
+# --- CÁC HÀM TIỆN ÍCH (Giữ nguyên) ---
 @torch.no_grad()
 def compute_psnr(pred, target):
     mse = torch.mean((pred - target) ** 2)
@@ -17,13 +15,11 @@ def compute_psnr(pred, target):
         return 100.0
     return (20.0 * torch.log10(1.0 / torch.sqrt(mse))).item()
 
-
 @torch.no_grad()
 def compute_ssim(pred, target):
     if pred.dim() == 3: pred = pred.unsqueeze(0)
     if target.dim() == 3: target = target.unsqueeze(0)
     return ssim(pred, target, data_range=1.0, size_average=True).item()
-
 
 @torch.no_grad()
 def compute_ms_ssim(pred, target):
@@ -31,17 +27,18 @@ def compute_ms_ssim(pred, target):
     if target.dim() == 3: target = target.unsqueeze(0)
     return ms_ssim(pred, target, data_range=1.0, size_average=True).item()
 
-
 @torch.no_grad()
 def compute_rmse(pred, target):
     return torch.sqrt(torch.mean((pred - target) ** 2)).item()
 
-
 def make_vis(inp, pred, gt):
     psnr = compute_psnr(pred, gt)
-    ssim_score = compute_ssim(pred, gt)
-    ms_ssim_score = compute_ms_ssim(pred, gt)
-    rmse = compute_rmse(pred, gt)
+    metrics = {
+        "psnr": psnr,
+        "ssim": compute_ssim(pred, gt),
+        "ms_ssim": compute_ms_ssim(pred, gt),
+        "rmse": compute_rmse(pred, gt)
+    }
 
     def to_np(x):
         x = x.detach().float().cpu()
@@ -51,62 +48,19 @@ def make_vis(inp, pred, gt):
         return x.permute(1, 2, 0).numpy()
 
     vis = np.concatenate([to_np(inp), to_np(pred), to_np(gt)], axis=1)
-
-    metrics = {
-        "psnr": psnr,
-        "ssim": ssim_score,
-        "ms_ssim": ms_ssim_score,
-        "rmse": rmse
-    }
     return vis, metrics
 
 
-def get_loop_steps_logs(inp, gt, intermediate_preds, halting_weights, halt_logits, max_samples=4, start_idx=0):
-    T = len(intermediate_preds)
-    B = min(inp.size(0), max_samples)
-    log_dict = {}
-
-    for b in range(B):
-        loop_images = []
-        for t in range(T):
-            inp_b = inp[b:b+1]
-            pred_t = intermediate_preds[t][b:b+1]
-            gt_b = gt[b:b+1]
-
-            vis, metrics = make_vis(inp_b, pred_t, gt_b)
-
-            exit_prob = torch.sigmoid(halt_logits[t][b]).mean().item() if halt_logits is not None else 0.0
-            act_w = halting_weights[t, b].item() if halting_weights is not None else 0.0
-
-            caption = (f"{t+1}/{T} | Exit: {exit_prob*100:.1f}% | "
-                       f"Weight: {act_w:.3f} | PSNR={metrics['psnr']:.2f} | "
-                       f"RMSE={metrics['rmse']:.4f} | "
-                       f"SSIM={metrics['ssim']:.4f} | MS-SSIM={metrics['ms_ssim']:.4f}")
-
-            loop_images.append(wandb.Image(vis, caption=caption))
-
-        # Sử dụng start_idx để không bị ghi đè index trên WandB khi khác batch
-        log_dict[f"val/sample_{start_idx + b}_progress"] = loop_images
-
-    return log_dict
-
-
+# --- 1. HÀM TRAIN 1 EPOCH (SẠCH SẼ VÀ TỐI ƯU CHO LOOPVIT) ---
 def train_one_epoch(
     model, loader, optimizer, scaler, criterion, device, epoch, cfg,
-    aug=None, stage=1, global_step=0,
-    accumulation_steps=4, max_steps_per_epoch=500
+    aug=None, global_step=0, accumulation_steps=4, max_steps_per_epoch=500
 ):
     model.train()
     running_loss = 0.0
-
     total_steps = min(len(loader), max_steps_per_epoch)
 
-    pbar = tqdm(
-        loader,
-        total=total_steps,
-        desc=f"Train Epoch {epoch} | Stage {stage}"
-    )
-
+    pbar = tqdm(loader, total=total_steps, desc=f"Train Epoch {epoch}")
     optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(pbar):
@@ -120,38 +74,22 @@ def train_one_epoch(
             inp, gt = aug(inp, gt)
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
-            outputs = model(inp, return_all=True)
-            pred, intermediate_preds, halting_weights, gate_logits, exit_probs = outputs
+            # BẮT BUỘC return_all=True khi Training để chạy đủ T bước
+            outputs, intermediate_preds, bottleneck_logits_list = model(inp, tau=0.05, return_all=True)
 
-            if halting_weights is not None and halting_weights.shape[0] != len(intermediate_preds):
-                T = len(intermediate_preds)
-                num_gpus = halting_weights.shape[0] // T
-                hw = halting_weights.view(num_gpus, T, -1).permute(1, 0, 2)
-                halting_weights = hw.reshape(T, -1)
-
-            if stage == 1:
-                loss, loss_dict = criterion(
-                    input_img=inp,
-                    target=gt,
-                    final_pred=pred,
-                    intermediate_preds=intermediate_preds,
-                    halting_weights=halting_weights,
-                    current_epoch=epoch
-                )
-            else:
-                loss, loss_dict = criterion(
-                    target=gt,
-                    final_pred=pred,
-                    intermediate_preds=intermediate_preds,
-                    halting_weights=halting_weights,
-                    halt_logits=gate_logits
-                )
+            # Truyền List vào Criterion
+            loss, loss_dict = criterion(
+                input_img=inp,
+                target=gt,
+                intermediate_preds=intermediate_preds,
+                bottleneck_logits_list=bottleneck_logits_list
+            )
 
         loss_raw = loss.item()
-
         loss = loss / accumulation_steps
         scaler.scale(loss).backward()
 
+        # Cập nhật Gradient
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -161,99 +99,62 @@ def train_one_epoch(
 
         running_loss += loss_raw
 
-        T_steps = halting_weights.shape[0] if halting_weights is not None else len(intermediate_preds)
-        
-        if halting_weights is not None:
-            step_ids = torch.arange(1, T_steps + 1, device=halting_weights.device).float().view(-1, 1)
-            expected_steps = (step_ids * halting_weights).sum(dim=0).mean().item()
-            hard_steps = halting_weights.argmax(dim=0).float().mean().item() + 1
-        else:
-            expected_steps = T_steps
-            hard_steps = T_steps
-
+        # Log WandB
         if batch_idx == total_steps - 1:
             wandb.log({
                 "train/loss": loss_raw,
-                "train/expected_steps": expected_steps,
-                "train/hard_steps": hard_steps,
                 "lr": optimizer.param_groups[0]["lr"],
                 **{f"train/{k}": (v.item() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
             }, step=global_step)
 
         global_step += 1
-        pbar.set_postfix(loss=f"{loss_raw:.4f}", steps=f"{expected_steps:.2f}")
+        pbar.set_postfix(loss=f"{loss_raw:.4f}")
 
     return running_loss / total_steps, global_step
 
 
-# VALIDATION (PHIÊN BẢN LOG THẲNG - SIÊU NHẸ RAM)
+# --- 2. HÀM VALIDATE (KIỂM TRA DỪNG ĐỘNG - EARLY EXIT) ---
 @torch.no_grad()
 def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log_images=4):
     model.eval()
 
-    loop_psnr_sums = None
-    loop_ssim_sums = None
-
-    psnr_sum = 0.0
-    ssim_sum = 0.0
-    ms_ssim_sum = 0.0
-    rmse_sum = 0.0
+    psnr_sum = ssim_sum = ms_ssim_sum = rmse_sum = 0.0
     total_images = 0
-    
+    total_exit_steps = 0.0  # Biến mới để theo dõi LoopViT tiết kiệm được bao nhiêu vòng lặp
     logged_images_count = 0
 
-    for i, batch in enumerate(tqdm(loader, desc="Validating Progressively")):
+    for i, batch in enumerate(tqdm(loader, desc="Validating")):
         inp = batch["inp"].to(device)
         gt = batch["gt"].to(device)
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
-            outputs = model(inp, return_all=True)
-
-        pred, inter_preds, halt_w, halt_logits, _ = outputs
-        
-        # SỬA LỖI DATAPARALLEL (Giữ nguyên phần này)
-        if halt_w is not None and halt_w.shape[0] != len(inter_preds):
-            T = len(inter_preds)
-            num_gpus = halt_w.shape[0] // T
-            hw = halt_w.view(num_gpus, T, -1).permute(1, 0, 2)
-            halt_w = hw.reshape(T, -1)
+            # Inference Mode: return_all=False để kích hoạt Entropy Hard-Exit
+            pred, exit_steps = model(inp, tau=0.05, return_all=False)
             
-            if halt_logits is not None:
-                hl = halt_logits.view(num_gpus, T, -1).permute(1, 0, 2)
-                halt_logits = hl.reshape(T, -1)
-        
-        T = len(inter_preds)
         batch_size = inp.size(0)
-
-        if loop_psnr_sums is None:
-            loop_psnr_sums = [0.0] * T
-            loop_ssim_sums = [0.0] * T
+        total_images += batch_size
+        
+        # Cộng dồn số bước đã exit để tính trung bình
+        total_exit_steps += exit_steps.float().sum().item()
 
         for b in range(batch_size):
             g_img = gt[b:b+1]
-            psnr_sum += compute_psnr(pred[b:b+1], g_img)
-            ssim_sum += compute_ssim(pred[b:b+1], g_img)
-            ms_ssim_sum += compute_ms_ssim(pred[b:b+1], g_img)
-            rmse_sum += compute_rmse(pred[b:b+1], g_img)
+            pred_img = pred[b:b+1]
+            
+            psnr_sum += compute_psnr(pred_img, g_img)
+            ssim_sum += compute_ssim(pred_img, g_img)
+            ms_ssim_sum += compute_ms_ssim(pred_img, g_img)
+            rmse_sum += compute_rmse(pred_img, g_img)
 
-            for t in range(T):
-                loop_psnr_sums[t] += compute_psnr(inter_preds[t][b:b+1], g_img)
-                loop_ssim_sums[t] += compute_ssim(inter_preds[t][b:b+1], g_img)
-            total_images += 1
-
-            # LOG TRỰC TIẾP LÊN WANDB (KHÔNG GOM BIẾN)
+            # Log ảnh mẫu trực tiếp lên WandB
             if log_images and logged_images_count < max_log_images:
-                # Chỉ lấy dữ liệu của 1 ảnh tại index b
-                img_inp = inp[b:b+1]
-                img_pred = pred[b:b+1]
-                img_gt = g_img
+                vis, metrics = make_vis(inp[b:b+1], pred_img, g_img)
+                # Kèm theo số vòng lặp thực tế mà sample này cần
+                caption = f"PSNR={metrics['psnr']:.2f} | Exit at Loop: {exit_steps[b].item()}"
                 
-                # Tạo log đơn lẻ
-                vis, metrics = make_vis(img_inp, img_pred, img_gt)
                 wandb.log({
-                    f"val/sample_{logged_images_count}_final": wandb.Image(vis, caption=f"PSNR={metrics['psnr']:.2f}")
+                    f"val/sample_{logged_images_count}": wandb.Image(vis, caption=caption)
                 }, step=global_step)
-                
                 logged_images_count += 1
 
     # Tính toán metrics cuối cùng
@@ -262,17 +163,14 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
         "val/ssim": ssim_sum / total_images,
         "val/ms_ssim": ms_ssim_sum / total_images,
         "val/rmse": rmse_sum / total_images,
+        "val/avg_exit_steps": total_exit_steps / total_images, # <--- METRIC QUAN TRỌNG NHẤT!
     }
-
-    for t in range(T):
-        val_metrics[f"val_loops/loop_{t+1}_psnr"] = loop_psnr_sums[t] / total_images
-        val_metrics[f"val_loops/loop_{t+1}_ssim"] = loop_ssim_sums[t] / total_images
 
     return val_metrics
 
 
-# MAIN TRAINING LOOP
-def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion, device, cfg, aug=None, stage=1):
+# --- 3. MAIN TRAINING LOOP ---
+def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion, device, cfg, aug=None):
     scaler = GradScaler(enabled=cfg.use_amp)
     best_psnr = 0.0
     global_step = 0
@@ -295,7 +193,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
 
         print(f"Continue training from epoch {start_epoch}, best_psnr={best_psnr:.3f}.")
     else:
-        print("No valid checkpoint found or resume_checkpoint is empty. Training from scratch.")
+        print("Training from scratch.")
 
     accumulation_steps = getattr(cfg, "accumulation_steps", 4)
     max_steps_per_epoch = getattr(cfg, "max_steps_per_epoch", 500)
@@ -311,7 +209,6 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
             epoch=epoch,
             cfg=cfg,
             aug=aug,
-            stage=stage,
             global_step=global_step,
             accumulation_steps=accumulation_steps,
             max_steps_per_epoch=max_steps_per_epoch
@@ -328,14 +225,15 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         }, step=global_step)
 
         current_psnr = val_metrics["val/psnr"]
+        avg_exit = val_metrics["val/avg_exit_steps"]
 
         state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
 
         if current_psnr > best_psnr:
             best_psnr = current_psnr
-            best_model_name = f"best_model_stage{stage}.pth"
+            best_model_name = "best_model.pth"
             torch.save(state_to_save, best_model_name)
-            print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f})")
+            print(f"→ Saved best model as '{best_model_name}' (PSNR: {best_psnr:.3f} | Avg Exit: {avg_exit:.2f})")
 
         checkpoint_state = {
             'epoch': epoch,
@@ -346,9 +244,9 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
             'scaler_state_dict': scaler.state_dict(),
             'best_psnr': best_psnr
         }
-        torch.save(checkpoint_state, f"latest_checkpoint_stage{stage}.pth")
+        torch.save(checkpoint_state, "latest_checkpoint.pth")
 
-        print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | SSIM: {val_metrics['val/ssim']:.4f}")
+        print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | Avg Exit Steps: {avg_exit:.2f}")
 
         if (epoch + 1) >= 5 and current_psnr < 15.0:
             print(f"Stop! At {epoch}: PSNR ({current_psnr:.3f}) < 15.0. Model is likely dying.")
