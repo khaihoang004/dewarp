@@ -141,7 +141,7 @@ class DocDeshadowNet(nn.Module):
                 
             return output, intermediate_preds, bottleneck_logits_list
 
-        return output
+        return output, exit_steps
 
     @torch.no_grad()
     def fuse_entire_model(self):
