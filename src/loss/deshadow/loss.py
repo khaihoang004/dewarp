@@ -142,7 +142,7 @@ class LABColorLoss(nn.Module):
         return total_loss
 
 
-class LoopViTDeshadowLoss(nn.Module):
+class DeshadowLoss(nn.Module):
     def __init__(
         self,
         main_weight=1.0,        # Trọng số cho L1/Charbonnier trực tiếp trên ảnh
