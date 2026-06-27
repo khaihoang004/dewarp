@@ -1,39 +1,11 @@
-"""
-repconv_fixed.py
-Sửa và chuẩn hoá RepConv3, RepConv7. Thêm RepConv3NoBN.
-
-Classes:
-  RepConv3      — 3×3 target, có BN + branch_weight (softmax)
-  RepConv3NoBN  — 3×3 target, không BN, cộng đơn giản, có residual
-  RepConv7      — 7×7 target, không BN, không residual
-
-Thay đổi so với bản gốc:
-  RepConv3:
-    [FIX-1]  fuse() gọi self.eval() trước khi đọc BN running stats
-    [FIX-2]  reparam khai báo tường minh bias=True
-    [FIX-3]  branch_weight / w_seq dùng .detach() khi fuse
-
-  RepConv7:
-    [FIX-1]  fuse() gọi self.eval() (good practice)
-    [FIX-2]  .detach() nhất quán khi đọc weights
-    [FIX-3]  grouped branch slice dùng bounds rõ ràng
-    [FIX-4]  reparam khai báo tường minh bias=True
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ─────────────────────────────────────────────────────────────
-# RepConv3BN  (3×3 kernel target, có BN)
-# ─────────────────────────────────────────────────────────────
-
 class RepConv3BN(nn.Module):
     """
-    Multi-branch reparameterisable conv → fused 3×3.
     Branches: 3×3 | 3×1 | 1×3 | 1×1 | Sequential(1×1→3×3)
-    Mỗi branch có BN riêng, trọng số học được (branch_weight),
     """
 
     def __init__(self, in_channels, out_channels, groups=1, deploy=False):
@@ -176,10 +148,6 @@ class RepConv3BN(nn.Module):
         return out
 
 
-# ─────────────────────────────────────────────────────────────
-# RepConv3NoBN  (3×3 kernel target, không BN, có residual)
-# ─────────────────────────────────────────────────────────────
-
 class RepConv3(nn.Module):
     def __init__(self, in_channels, out_channels, groups=1, deploy=False):
         super().__init__()
@@ -203,7 +171,7 @@ class RepConv3(nn.Module):
                 _c((3, 1), (1, 0)),    # 1: 3×1
                 _c((1, 3), (0, 1)),    # 2: 1×3
                 _c(1,      0     ),    # 3: 1×1
-                nn.Sequential(         # 4: 1×1 → 3×3  (bias=False để fold sạch)
+                nn.Sequential(         # 4: 1×1 → 3×3
                     nn.Conv2d(in_channels, in_channels,  1,
                               groups=groups, bias=False),
                     nn.Conv2d(in_channels, out_channels, 3,
@@ -227,17 +195,6 @@ class RepConv3(nn.Module):
     @staticmethod
     def _fold_1x1_into_3x3(w1: torch.Tensor, w2: torch.Tensor,
                             groups: int = 1) -> torch.Tensor:
-        """
-        Fold Conv1×1(w1, bias=False) → Conv3×3(w2) thành Conv3×3.
-        w1 : [C_in,     C_in/g,  1, 1]
-        w2 : [C_out,    C_in/g,  3, 3]
-        out: [C_out,    C_in/g,  3, 3]
-
-        Dùng F.conv2d(w2, w1.permute(1,0,2,3)):
-          - input  = w2  shape [C_out, C_in/g, 3, 3]  (treated as a "batch of filters")
-          - weight = w1T shape [C_in/g, C_in,  1, 1]  (1×1 mixing)
-          → output shape [C_out, C_in/g, 3, 3]  ✓
-        """
         if groups == 1:
             return F.conv2d(w2, w1.permute(1, 0, 2, 3))
         icpg = w1.shape[0] // groups
@@ -251,26 +208,19 @@ class RepConv3(nn.Module):
             ))
         return torch.cat(slices, dim=0)
 
-    # ── fuse ─────────────────────────────────────────────────
 
     def fuse(self, delete_branches: bool = True):
-        """
-        Cộng tất cả branch weights và biases vào reparam.
-        Không cần .eval() vì không có BN.
-        """
         if self.deploy:
             return
 
         W = torch.zeros_like(self.reparam.weight)
         B = torch.zeros_like(self.reparam.bias)
 
-        # Branch 0–3: conv đơn giản
         for i in range(4):
             conv = self.branches[i]
             W += self._pad_to_3x3(conv.weight.detach())
             B += conv.bias.detach()
 
-        # Branch 4: Sequential 1×1 → 3×3
         w1   = self.branches[4][0].weight.detach()   # [C_in,  C_in/g, 1, 1]
         w2   = self.branches[4][1].weight.detach()   # [C_out, C_in/g, 3, 3]
         b2   = self.branches[4][1].bias.detach()     # [C_out]
@@ -284,8 +234,6 @@ class RepConv3(nn.Module):
             self._delete_branches()
 
         self.deploy = True
-
-    # ── forward ──────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.deploy:
@@ -301,17 +249,10 @@ class RepConv3(nn.Module):
         return out
 
 
-# ─────────────────────────────────────────────────────────────
-# RepConv7  (7×7 kernel target, không có residual, không có BN)
-# ─────────────────────────────────────────────────────────────
-
 class RepConv7(nn.Module):
     """
-    Multi-branch reparameterisable conv → fused 7×7.
     Branches: 7×7 | 7×1 | 1×7 | 7×5 | 5×7 | 5×5 | 1×5 | 5×1
               | Sequential(1×1→7×7)
-    Không có BN, không có residual (thiết kế gốc).
-    [FIX-4] Nếu cần residual, thêm x + ... vào forward/deploy.
     """
 
     def __init__(self, in_channels, out_channels, groups=1, deploy=False):
@@ -341,7 +282,6 @@ class RepConv7(nn.Module):
             self.conv_1x5 = _c((1, 5),  (0, 2) )
             self.conv_5x1 = _c((5, 1),  (2, 0) )
 
-            # Sequential 1×1 → 7×7, bias=False ở cả 2 (fold sẽ bỏ bias)
             self.conv_1x1_branch = nn.Conv2d(
                 in_channels, in_channels, 1,
                 groups=groups, bias=False)
@@ -349,7 +289,6 @@ class RepConv7(nn.Module):
                 in_channels, out_channels, 7,
                 padding=3, groups=groups, bias=False)
 
-    # ── helpers ──────────────────────────────────────────────
 
     def _delete_branches(self):
         for name in (
@@ -386,13 +325,11 @@ class RepConv7(nn.Module):
             ))
         return torch.cat(slices, dim=0)
 
-    # ── fuse ─────────────────────────────────────────────────
 
     def fuse(self, delete_branches: bool = True):
         if self.deploy:
             return
 
-        # [FIX-2] eval không cần thiết ở đây (không có BN) nhưng là good practice
         self.eval()
 
         W = torch.zeros_like(self.reparam.weight)
@@ -403,7 +340,6 @@ class RepConv7(nn.Module):
                 self.out_channels, device=conv.weight.device)
             return conv.weight.detach(), b.detach()
 
-        # Tất cả branch trực tiếp
         for conv in (
             self.conv_7x7,
             self.conv_7x1, self.conv_1x7,
@@ -415,14 +351,12 @@ class RepConv7(nn.Module):
             W += self._pad_to_7x7(w)
             B += b
 
-        # Sequential branch
         w_seq = self._fold_1x1_into_kxk(
             self.conv_1x1_branch.weight.detach(),
             self.conv_7x7_branch.weight.detach(),
             self.groups,
         )
         W += w_seq
-        # bias = 0 vì cả 2 conv đều bias=False
 
         self.reparam.weight.data.copy_(W)
         self.reparam.bias.data.copy_(B)
@@ -432,11 +366,9 @@ class RepConv7(nn.Module):
 
         self.deploy = True
 
-    # ── forward ──────────────────────────────────────────────
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.deploy:
-            return self.reparam(x)   # không có residual — thiết kế gốc
+            return self.reparam(x)
 
         return (
             self.conv_7x7(x)
@@ -446,3 +378,137 @@ class RepConv7(nn.Module):
             + self.conv_1x5(x) + self.conv_5x1(x)
             + self.conv_7x7_branch(self.conv_1x1_branch(x))
         )
+
+
+class DWRepConv3(nn.Module):
+    def __init__(self, channels, deploy=False):
+        super().__init__()
+        self.channels = channels
+        self.deploy   = deploy
+
+        self.reparam = nn.Conv2d(
+            channels, channels, 3,
+            padding=1, groups=channels, bias=True
+        )
+
+        if not deploy:
+            def _c(k, p):
+                return nn.Conv2d(channels, channels, k,
+                                 padding=p, groups=channels, bias=True)
+
+            self.branches = nn.ModuleList([
+                _c(3,      1     ),    # 0: 3×3
+                _c((3, 1), (1, 0)),    # 1: 3×1
+                _c((1, 3), (0, 1)),    # 2: 1×3
+                _c(1,      0     ),    # 3: 1×1
+                nn.Sequential(         # 4: 1×1 → 3×3
+                    nn.Conv2d(channels, channels, 1, groups=channels, bias=False),
+                    nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True),
+                ),
+            ])
+
+    def _pad_to_3x3(self, w: torch.Tensor) -> torch.Tensor:
+        _, _, h, wk = w.shape
+        ph, pw = 3 - h, 3 - wk
+        pt, pb = ph // 2, ph - ph // 2
+        pl, pr = pw // 2, pw - pw // 2
+        return F.pad(w, [pl, pr, pt, pb])
+
+    def fuse(self, delete_branches: bool = True):
+        if self.deploy:
+            return
+
+        W = torch.zeros_like(self.reparam.weight)
+        B = torch.zeros_like(self.reparam.bias)
+
+        # Gộp nhánh 0-3 (Cộng trực tiếp trọng số và bias)
+        for i in range(4):
+            conv = self.branches[i]
+            W += self._pad_to_3x3(conv.weight.detach())
+            B += conv.bias.detach()
+
+        # Gộp nhánh 4 (Sequential) - Dùng phép nhân ma trận tối ưu cho DW
+        w1 = self.branches[4][0].weight.detach()
+        w2 = self.branches[4][1].weight.detach()
+        b2 = self.branches[4][1].bias.detach()
+        
+        W += w1 * w2
+        B += b2
+
+        self.reparam.weight.data.copy_(W)
+        self.reparam.bias.data.copy_(B)
+
+        if delete_branches:
+            delattr(self, 'branches')
+            
+        self.deploy = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.deploy:
+            return self.reparam(x)
+        return sum(branch(x) for branch in self.branches)
+
+
+# 2. RepPointwise (Pointwise 1x1 - Không BN)
+class RepPointwise(nn.Module):
+    def __init__(self, in_channels, out_channels, deploy=False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.deploy = deploy
+
+        self.reparam = nn.Conv2d(in_channels, out_channels, 1, bias=True)
+
+        if not deploy:
+            self.conv = nn.Conv2d(in_channels, out_channels, 1, bias=True)
+            self.has_identity = (in_channels == out_channels)
+
+    def fuse(self, delete_branches: bool = True):
+        if self.deploy: return
+
+        W = self.conv.weight.detach().clone()
+        B = self.conv.bias.detach().clone()
+
+        if self.has_identity:
+            W_id = torch.zeros_like(W)
+            for i in range(self.in_channels):
+                W_id[i, i, 0, 0] = 1.0
+            
+            W += W_id
+
+        self.reparam.weight.data.copy_(W)
+        self.reparam.bias.data.copy_(B)
+
+        if delete_branches:
+            delattr(self, 'conv')
+            
+        self.deploy = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.deploy:
+            return self.reparam(x)
+        
+        out = self.conv(x)
+        if self.has_identity:
+            out += x
+        return out
+
+
+class RepDWSeparable(nn.Module):
+    def __init__(self, in_channels, out_channels, deploy=False):
+        super().__init__()
+        
+        # Depthwise -> ReLU -> Pointwise
+        self.dw = DWRepConv3(channels=in_channels, deploy=deploy)
+        self.act = nn.ReLU(inplace=True)
+        self.pw = RepPointwise(in_channels, out_channels, deploy=deploy)
+
+    def fuse(self, delete_branches: bool = True):
+        self.dw.fuse(delete_branches)
+        self.pw.fuse(delete_branches)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dw(x)
+        x = self.act(x)
+        x = self.pw(x)
+        return x
