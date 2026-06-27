@@ -22,34 +22,30 @@ class DocumentStripAttention(nn.Module):
         x_h = self.dwconv_h(self.conv_h1(x))
         return self.proj(F.gelu(x_w + x_h))
 
-class RepAttn(nn.Module):
+class RepAttention(nn.Module):
     """ Re-parameterizable Attention Block using MonarchAttention """
     def __init__(self, dim, num_heads=8, block_size=16, num_steps=2, pad_type="pre", impl="torch", deploy=False):
         super().__init__()
         self.num_heads = num_heads
+        self.deploy = deploy
+        
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1)
+        self.proj = nn.Conv2d(dim, dim, kernel_size=1)
+        
         self.monarch_attn = MonarchAttention(
             block_size=block_size,
             num_steps=num_steps,
             pad_type=pad_type,
             impl=impl
         )
-        if deploy:
-            self.attn_fn = self.monarch_attn
-        else:
-            self.attn_fn = self.common_attn
-        self.proj = nn.Conv2d(dim, dim, kernel_size=1)
-        self.deploy = deploy
+
+        self.attn_fn = self.monarch_attn if deploy else self.common_attn
 
     def common_attn(self, q, k, v):
-        scale = (q.shape[-1]) ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = attn.softmax(dim=-1)
-        out = attn @ v
-        return out
+        return F.scaled_dot_product_attention(q, k, v)
 
     @torch.no_grad()
-    def fuse(self):
+    def fuse(self, delete_branches: bool = True):
         if not self.deploy:
             self.attn_fn = self.monarch_attn
             self.deploy = True
