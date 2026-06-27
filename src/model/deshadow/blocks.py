@@ -27,6 +27,23 @@ class RepDATBlock(nn.Module):
         x = x + self.scale2(self.ffn(self.norm2(x)))
         return x
 
+class LocalStripBlock(nn.Module):
+    def __init__(self, dim, deploy=False):
+        super().__init__()
+        self.norm1 = RMSNorm2d(dim)
+        self.strip_attn = DocumentStripAttention(dim)
+        self.scale1 = LayerScale(dim, init_value=0.5)
+        
+        self.norm2 = RMSNorm2d(dim)
+        self.ffn = SwiGLU_FFN(dim)
+        self.scale2 = LayerScale(dim, init_value=0.5)
+
+    def forward(self, x):
+        nx = self.norm1(x)
+        x = x + self.scale1(self.strip_attn(nx))
+        x = x + self.scale2(self.ffn(self.norm2(x)))
+        return x
+
 class EncoderStage(nn.Module):
     def __init__(self, in_channels, out_channels, num_blocks=1, num_heads=8, deploy=False):
         super().__init__()
@@ -34,7 +51,7 @@ class EncoderStage(nn.Module):
         self.act = nn.GELU()
         
         self.blocks = nn.ModuleList([
-            RepDATBlock(out_channels, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
+            LocalStripBlock(out_channels, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
         ])
         
         self.norm_feat = RMSNorm2d(out_channels)
@@ -61,7 +78,7 @@ class DecoderStage(nn.Module):
         self.gate_conv = nn.Conv2d(in_channels, skip_channels, kernel_size=1)
         self.conv = RepConv3(in_channels + skip_channels, out_channels, deploy=deploy)
         self.blocks = nn.ModuleList([
-            RepDATBlock(out_channels, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
+            LocalStripBlock(out_channels, num_heads=num_heads, deploy=deploy) for _ in range(num_blocks)
         ])
         self.norm_out = RMSNorm2d(out_channels)
 
