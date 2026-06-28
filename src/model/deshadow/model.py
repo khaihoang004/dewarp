@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.modules.repconv import *
-from src.model.modules.attention import RepAttention
+from src.model.monarch_attn import MonarchAttention
 
 
 class RMSNorm2d(nn.Module):
@@ -136,13 +136,23 @@ class SwiGLU_FFN(nn.Module):
 
 
 class BottleneckBlock(nn.Module):
-    def __init__(self, dim, num_heads=4, deploy=False, **attn_kwargs):
+    def __init__(
+        self, dim, num_heads=4, block_size=16, num_steps=2, pad_type="pre", impl="torch", deploy=False):
         super().__init__()
         self.deploy = deploy
-        
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
         # 1. Global Branch
         self.norm1 = RMSNorm2d(dim)
-        self.attn = RepAttention(dim=dim, num_heads=num_heads, deploy=deploy, **attn_kwargs)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.attn = MonarchAttention(
+            block_size=block_size,
+            num_steps=num_steps,
+            pad_type=pad_type,
+            impl=impl
+        )
         self.scale1 = LayerScale(dim, init_value=0.5)
 
         # 2. Local Branch
@@ -156,14 +166,33 @@ class BottleneckBlock(nn.Module):
 
     def fuse(self, delete_branches: bool = True):
         if self.deploy: return
-        self.attn.fuse(delete_branches)
         self.conv.fuse(delete_branches)
         self.ffn.fuse(delete_branches)
         self.deploy = True
 
     def forward(self, x):
+        B, C, H, W = x.shape
+        N = H * W
+
         # 1. Global Attention
-        x = x + self.scale1(self.attn(self.norm1(x)))
+        x_norm = self.norm1(x)
+
+        x_flat = x_norm.flatten(2).transpose(1, 2)  # [B, N, C]
+
+        qkv = self.qkv(x_flat)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # reshape multi-head
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = self.attn(q, k, v)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, C)
+        attn_out = attn_out.transpose(1, 2).view(B, C, H, W)
+
+        x = x + self.scale1(attn_out)
 
         # 2. Local Convolution
         x = x + self.scale2(self.conv(x))
@@ -420,7 +449,6 @@ class LoopRepDocEnhanceNet(nn.Module):
 
         final_feat = bottleneck_out["final_state"]
 
-        # Nhánh 1: Cần trả về các tensor trung gian để feed vào hàm Loss
         if self.training or calc_loss:
             states = bottleneck_out["states"]
             exit_logits = bottleneck_out["exit_logits"]
@@ -444,7 +472,6 @@ class LoopRepDocEnhanceNet(nn.Module):
                 "halting": halting,
             }
 
-        # Nhánh 2: Inference bình thường
         final_out = self._decode(final_feat, skip1, skip2, skip3, x_ori)
 
         if return_steps:
