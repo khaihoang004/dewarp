@@ -222,14 +222,21 @@ class BottleneckLayer(nn.Module):
 class AdaptiveLoopedBottleneck(nn.Module):
     def __init__(self, dim, max_loops=6, num_heads=4, deploy=False):
         super().__init__()
+
         self.deploy = deploy
         self.max_loops = max_loops
-        self.layer = BottleneckLayer(dim, num_heads=num_heads, deploy=deploy)
+
+        self.layer = BottleneckLayer(
+            dim,
+            num_heads=num_heads,
+            deploy=deploy,
+        )
+
         self.step_embeddings = nn.Parameter(
             torch.zeros(max_loops, 1, dim, 1, 1)
         )
         nn.init.normal_(self.step_embeddings, std=0.02)
- 
+
     def fuse(self, delete_branches=True):
         if self.deploy:
             return
@@ -237,69 +244,100 @@ class AdaptiveLoopedBottleneck(nn.Module):
         self.deploy = True
 
     def _build_halting_distribution(self, exit_logits):
-        p = torch.sigmoid(exit_logits)  # (T, B)
+        """
+        exit_logits : (T, B)
+        """
+        p = torch.sigmoid(exit_logits)
+
         T, B = p.shape
-        
+
         one_minus_p = 1.0 - p
-        cumprod = torch.cat([torch.ones(1, B, device=p.device), one_minus_p[:-1]], dim=0)
-        S = torch.cumprod(cumprod, dim=0)
-        h = p * S
-        
-        # Absorb leftover probability into (T-1)
-        remainder = 1.0 - h.sum(dim=0, keepdim=True)
-        h[-1] += remainder.squeeze(0)
-        
-        return p, S, h
 
-    def forward(self, x, halt_threshold=0.85, return_all=False):
+        survival = torch.cat(
+            [
+                torch.ones(1, B, device=p.device),
+                one_minus_p[:-1],
+            ],
+            dim=0,
+        )
 
+        survival = torch.cumprod(survival, dim=0)
+
+        halting = p * survival
+
+        remainder = 1.0 - halting.sum(dim=0, keepdim=True)
+        halting[-1] += remainder.squeeze(0)
+
+        return p, survival, halting
+
+    def forward(
+        self,
+        x,
+        halt_threshold=0.85,
+        return_all=False,
+    ):
         B = x.shape[0]
-        x_orig = x.clone()
-
-        states = []
-        exit_logits = []
-
-        state = x
-
-        for t in range(self.max_loops):
-            state, logit = self.layer(
-                state,
-                x_orig,
-                self.step_embeddings[t]
-            )
-
-            states.append(state)
-            exit_logits.append(logit)
-
-        exit_logits = torch.stack(exit_logits, dim=0)  # (T, B)
+        x_orig = x
 
         if self.training or return_all:
+
+            states = []
+            exit_logits = []
+
+            state = x
+
+            for t in range(self.max_loops):
+
+                state, logit = self.layer(
+                    state,
+                    x_orig,
+                    self.step_embeddings[t],
+                )
+
+                states.append(state)
+                exit_logits.append(logit)
+
+            exit_logits = torch.stack(exit_logits, dim=0)
+
             p, S, h = self._build_halting_distribution(exit_logits)
 
             return {
                 "final_state": state,
                 "states": states,
-                "exit_logits": exit_logits,   # raw
-                "exit_prob": p,               # p_t
-                "survival": S,                # S_t
-                "halting": h                  # h_t (distribution)
+                "exit_logits": exit_logits,
+                "exit_prob": p,
+                "survival": S,
+                "halting": h,
             }
-        state = x
-        survival = torch.ones(B, device=x.device)
+
+        state = x.clone()
+
+        survival = torch.ones(B, device=x.device, dtype=x.dtype)
+        alive = torch.ones(B, device=x.device, dtype=torch.bool)
 
         for t in range(self.max_loops):
-            state, logit = self.layer(
-                state,
-                x_orig,
-                self.step_embeddings[t]
+
+            if not alive.any():
+                break
+
+            idx = alive.nonzero(as_tuple=True)[0]
+
+            state_alive = state[idx]
+            orig_alive = x_orig[idx]
+
+            state_new, logit = self.layer(
+                state_alive,
+                orig_alive,
+                self.step_embeddings[t],
             )
 
-            p = torch.sigmoid(logit)  # (B,)
+            state[idx] = state_new
 
-            survival = survival * (1.0 - p)
+            p = torch.sigmoid(logit)
 
-            if (1.0 - survival).mean() > halt_threshold:
-                break
+            survival[idx] = survival[idx] * (1.0 - p)
+
+            alive[idx] = (1.0 - survival[idx]) < halt_threshold
 
         return state
     
