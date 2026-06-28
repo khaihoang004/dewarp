@@ -200,22 +200,23 @@ class BottleneckLayer(nn.Module):
         concat = torch.cat([x, x_orig], dim=1)
         fused = self.act(self.fusion_pw(concat))
         fused = self.act(self.fusion_dw(fused))
- 
+
         if step_embed is not None:
             fused = fused + step_embed
- 
+
         x = x + fused
- 
+
         for block in self.blocks:
             x = block(x)
- 
+
         # Exit head
-        exit_feat = F.adaptive_avg_pool2d(x, 1)
-        exit_feat = self.act(self.exit_head_1(exit_feat))
-        exit_logit = self.exit_head_2(exit_feat).flatten(1).squeeze(1)  # shape (B,)
-        exit_prob = torch.sigmoid(exit_logit)
- 
-        return x, exit_logit, exit_prob
+        exit_feat = F.adaptive_avg_pool2d(x, 1) # (B, C, 1, 1)
+        exit_feat = self.act(self.exit_head_1(exit_feat)) # (B, dim//4, 1, 1)
+        exit_logit = self.exit_head_2(exit_feat) # (B, 1, 1, 1)
+        
+        exit_logit = exit_logit.view(exit_logit.size(0)) 
+
+        return x, exit_logit
  
  
 class AdaptiveLoopedBottleneck(nn.Module):
@@ -234,49 +235,74 @@ class AdaptiveLoopedBottleneck(nn.Module):
             return
         self.layer.fuse(delete_branches)
         self.deploy = True
- 
+
+    def _build_halting_distribution(self, exit_logits):
+        p = torch.sigmoid(exit_logits)  # (T, B)
+        T, B = p.shape
+        
+        one_minus_p = 1.0 - p
+        cumprod = torch.cat([torch.ones(1, B, device=p.device), one_minus_p[:-1]], dim=0)
+        S = torch.cumprod(cumprod, dim=0)
+        h = p * S
+        
+        # Absorb leftover probability into (T-1)
+        remainder = 1.0 - h.sum(dim=0, keepdim=True)
+        h[-1] += remainder.squeeze(0)
+        
+        return p, S, h
+
     def forward(self, x, halt_threshold=0.85, return_all=False):
+
         B = x.shape[0]
-        device = x.device
- 
         x_orig = x.clone()
- 
+
+        states = []
+        exit_logits = []
+
+        state = x
+
+        for t in range(self.max_loops):
+            state, logit = self.layer(
+                state,
+                x_orig,
+                self.step_embeddings[t]
+            )
+
+            states.append(state)
+            exit_logits.append(logit)
+
+        exit_logits = torch.stack(exit_logits, dim=0)  # (T, B)
+
         if self.training or return_all:
-            states, exit_logits, exit_probs = [], [], []
-            state = x
-            for t in range(self.max_loops):
-                state, logit, prob = self.layer(
-                    state, x_orig, self.step_embeddings[t]
-                )
-                states.append(state)
-                exit_logits.append(logit)
-                exit_probs.append(prob)
- 
+            p, S, h = self._build_halting_distribution(exit_logits)
+
             return {
                 "final_state": state,
                 "states": states,
-                "exit_logits": torch.stack(exit_logits, dim=0),   # (T, B)
-                "exit_probs": torch.stack(exit_probs, dim=0),     # (T, B)
+                "exit_logits": exit_logits,   # raw
+                "exit_prob": p,               # p_t
+                "survival": S,                # S_t
+                "halting": h                  # h_t (distribution)
             }
- 
-        # Inference mode
         state = x
-        cumulative = torch.zeros(B, device=device)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
- 
+        survival = torch.ones(B, device=x.device)
+
         for t in range(self.max_loops):
-            state, logit, prob = self.layer(
-                state, x_orig, self.step_embeddings[t]
+            state, logit = self.layer(
+                state,
+                x_orig,
+                self.step_embeddings[t]
             )
-            # prob shape: (B,) — đúng, không cần squeeze
-            cumulative = cumulative + prob * (1.0 - cumulative)
-            finished = finished | (cumulative >= halt_threshold)
- 
-            if finished.all():
+
+            p = torch.sigmoid(logit)  # (B,)
+
+            survival = survival * (1.0 - p)
+
+            if (1.0 - survival).mean() > halt_threshold:
                 break
- 
+
         return state
- 
+    
  
 class ShallowExtractor(nn.Module):
     def __init__(self, in_channels, out_channels, deploy=False):
@@ -347,30 +373,35 @@ class LoopRepDocEnhanceNet(nn.Module):
         bottleneck_out = self.bottleneck(
             e3,
             halt_threshold=halt_threshold,
-            return_all=return_all,
+            return_all=True,
         )
  
+        if isinstance(bottleneck_out, dict):
+            final_feat = bottleneck_out["final_state"]
+        else:
+            final_feat = bottleneck_out
+
         if self.training or return_all:
-            final_state = bottleneck_out["final_state"]
-            states = bottleneck_out["states"]           # list of tensors
-            exit_logits = bottleneck_out["exit_logits"]
-            exit_probs = bottleneck_out["exit_probs"]
+            if isinstance(bottleneck_out, dict):
+                states = bottleneck_out["states"]
+                exit_logits = bottleneck_out["exit_logits"]
+                exit_prob = bottleneck_out["exit_prob"]
+                survival = bottleneck_out["survival"]
+                halting = bottleneck_out["halting"]
+
+                final_out = self._decode(final_feat, skip1, skip2, skip3, x_ori)
+                intermediate_preds = [self._decode(s, skip1, skip2, skip3, x_ori) for s in states]
+
+                return {
+                    "final": final_out,
+                    "intermediate": intermediate_preds,
+                    "exit_logits": exit_logits,
+                    "exit_prob": exit_prob,
+                    "survival": survival,
+                    "halting": halting,
+                }
  
-            final_out = self._decode(final_state, skip1, skip2, skip3, x_ori)
- 
-            intermediate_preds = [
-                self._decode(s, skip1, skip2, skip3, x_ori)
-                for s in states
-            ]
- 
-            return {
-                "final": final_out,
-                "intermediate": intermediate_preds,
-                "exit_logits": exit_logits,
-                "exit_probs": exit_probs,
-            }
- 
-        return self._decode(bottleneck_out, skip1, skip2, skip3, x_ori)
+        return self._decode(final_feat, skip1, skip2, skip3, x_ori)
  
     @torch.no_grad()
     def fuse_entire_model(self):
