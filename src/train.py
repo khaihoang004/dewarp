@@ -61,7 +61,7 @@ def train_one_epoch(
     total_steps = min(len(loader), max_steps_per_epoch)
 
     # Thêm log_freq (bao nhiêu batch thì log lên wandb 1 lần, mặc định 50)
-    log_freq = getattr(cfg, "log_freq", 50)
+    log_freq = getattr(cfg, "log_freq", 100)
     grad_clip = getattr(cfg, "grad_clip", 1.0)
 
     pbar = tqdm(loader, total=total_steps, desc=f"Train Epoch {epoch}")
@@ -105,18 +105,18 @@ def train_one_epoch(
             
             # --- TÍNH KỲ VỌNG SỐ VÒNG LẶP (EXPECTED STEPS) ---
             h = out["halting"] # Shape: (T, B)
+            h_mean_cpu = h_mean.detach().cpu()
             h_mean = h.mean(dim=1) # Trung bình theo batch, ra shape (T,)
 
             # --- IN RA XÁC SUẤT TẠI CÁC LOOP ---
-            print(f"\n[Step {global_step}] Halting Probabilities per Loop:")
-            probs_dict = {f"Loop {t+1}": f"{val:.4f}" for t, val in enumerate(h_mean)}
-            print(probs_dict)
+            print(
+                f"[Step {global_step}] Halting Probs: " +
+                " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean))
+            )
             T_steps = h.shape[0]
             
-            # Tạo vector [1, 2, ..., T]
             step_indices = torch.arange(1, T_steps + 1, device=h.device).view(T_steps, 1).float()
             
-            # Expected steps = sum(h_t * t)
             expected_steps = (h * step_indices).sum(dim=0).mean().item()
             # ---------------------------------------------------
 
