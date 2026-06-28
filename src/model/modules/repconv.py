@@ -298,7 +298,7 @@ class RepPointwiseBN(nn.Module):
 
 # SEPARABLE CONVOLUTION MODULES
 class RepDWSeparable3BN(nn.Module):
-    def __init__(self, in_channels, out_channels, expand=4, deploy=False):
+    def __init__(self, in_channels, out_channels, expand=2, deploy=False):
         super().__init__()
 
         self.use_skip = (in_channels == out_channels)
