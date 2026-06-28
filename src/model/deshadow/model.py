@@ -385,8 +385,8 @@ class LoopRepDocEnhanceNet(nn.Module):
         base_dim=32,
         max_loops=4,
         num_heads=4,
-        enc_blocks=[2, 2, 2],
-        dec_blocks=[2, 2, 2],
+        enc_blocks=[1, 1, 2],
+        dec_blocks=[1, 1, 2],
         deploy=False,
     ):
         super().__init__()
