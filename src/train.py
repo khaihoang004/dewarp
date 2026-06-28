@@ -102,11 +102,23 @@ def train_one_epoch(
 
         # LOG THEO TẦN SUẤT (Tránh việc đồ thị bị thiếu)
         if (batch_idx + 1) % log_freq == 0 or (batch_idx + 1) == total_steps:
-            # Dọn dẹp key "loss/" từ criterion để wandb group đẹp hơn
+            
+            # --- TÍNH KỲ VỌNG SỐ VÒNG LẶP (EXPECTED STEPS) ---
+            h = out["halting"] # Shape: (T, B)
+            T_steps = h.shape[0]
+            
+            # Tạo vector [1, 2, ..., T]
+            step_indices = torch.arange(1, T_steps + 1, device=h.device).view(T_steps, 1).float()
+            
+            # Expected steps = sum(h_t * t)
+            expected_steps = (h * step_indices).sum(dim=0).mean().item()
+            # ---------------------------------------------------
+
             clean_loss_dict = {f"train/{k.replace('loss/', '')}": v for k, v in loss_dict.items()}
             
             wandb.log({
                 "train/loss": loss_raw,
+                "train/expected_steps": expected_steps, # LOG THÊM VÀO ĐÂY
                 "lr": optimizer.param_groups[0]["lr"],
                 **clean_loss_dict
             }, step=global_step)
