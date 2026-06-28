@@ -109,10 +109,10 @@ def train_one_epoch(
             h_mean_cpu = h_mean.detach().cpu()
 
             # --- IN RA XÁC SUẤT TẠI CÁC LOOP ---
-            print(
-                f"[Step {global_step}] Halting Probs: " +
-                " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean_cpu))
-            )
+            # print(
+            #     f"[Step {global_step}] Halting Probs: " +
+            #     " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean_cpu))
+            # )
             T_steps = h.shape[0]
             
             step_indices = torch.arange(1, T_steps + 1, device=h.device).view(T_steps, 1).float()
@@ -272,7 +272,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
 
         print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | Avg Exit Steps: {avg_exit:.2f}")
 
-        if (epoch + 1) >= 5 and current_psnr < 10.0:
+        if (epoch + 1) >= 5 and current_psnr < 8.0:
             print(f"Stop! At {epoch}: PSNR ({current_psnr:.3f}) < 15.0. Model is likely dying.")
             break
 
