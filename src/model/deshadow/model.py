@@ -274,31 +274,27 @@ class AdaptiveLoopedBottleneck(nn.Module):
         self,
         x,
         halt_threshold=0.85,
-        return_all=False,
+        calc_loss=False, # Đổi tên thành calc_loss
     ):
         B = x.shape[0]
         x_orig = x
 
-        if self.training or return_all:
-
+        # BẮT BUỘC FULL LOOP NẾU ĐANG TRAIN HOẶC CẦN TÍNH VALIDATION LOSS
+        if self.training or calc_loss: 
             states = []
             exit_logits = []
-
             state = x
 
             for t in range(self.max_loops):
-
                 state, logit = self.layer(
                     state,
                     x_orig,
                     self.step_embeddings[t],
                 )
-
                 states.append(state)
                 exit_logits.append(logit)
 
             exit_logits = torch.stack(exit_logits, dim=0)
-
             p, S, h = self._build_halting_distribution(exit_logits)
 
             return {
@@ -310,18 +306,17 @@ class AdaptiveLoopedBottleneck(nn.Module):
                 "halting": h,
             }
 
-        state = x.clone()
-
+        # CHẾ ĐỘ SUY LUẬN (INFERENCE)
+        state = x.clone() 
         survival = torch.ones(B, device=x.device, dtype=x.dtype)
         alive = torch.ones(B, device=x.device, dtype=torch.bool)
+        exit_steps = torch.ones(B, device=x.device, dtype=torch.long)
 
         for t in range(self.max_loops):
-
             if not alive.any():
                 break
 
             idx = alive.nonzero(as_tuple=True)[0]
-
             state_alive = state[idx]
             orig_alive = x_orig[idx]
 
@@ -330,17 +325,20 @@ class AdaptiveLoopedBottleneck(nn.Module):
                 orig_alive,
                 self.step_embeddings[t],
             )
-
             state[idx] = state_new
 
             p = torch.sigmoid(logit)
+            survival[idx] *= (1.0 - p)
 
-            survival[idx] = survival[idx] * (1.0 - p)
+            still_alive = (1.0 - survival[idx]) < halt_threshold
+            alive[idx] = still_alive
 
-            alive[idx] = (1.0 - survival[idx]) < halt_threshold
+            exit_steps[idx] += still_alive.long()
 
-        return state
-    
+        return {
+            "final_state": state,
+            "exit_steps": exit_steps,
+        }
  
 class ShallowExtractor(nn.Module):
     def __init__(self, in_channels, out_channels, deploy=False):
@@ -400,46 +398,62 @@ class LoopRepDocEnhanceNet(nn.Module):
         output = x_ori + residual
         return torch.clamp(output, 0.0, 1.0)
  
-    def forward(self, x, halt_threshold=0.80, return_all=False):
+    def forward(
+        self, 
+        x, 
+        halt_threshold=0.80, 
+        calc_loss=False,     # Dùng khi Validation cần tính Loss
+        return_steps=False   # Dùng khi Test cần xem số vòng lặp
+    ):
         x_ori = x
- 
+
         s0 = self.shallow_extractor(x)
         skip1, e1 = self.enc1(s0)
         skip2, e2 = self.enc2(e1)
         skip3, e3 = self.enc3(e2)
- 
+
         bottleneck_out = self.bottleneck(
             e3,
             halt_threshold=halt_threshold,
-            return_all=True,
+            calc_loss=calc_loss,
         )
- 
-        if isinstance(bottleneck_out, dict):
-            final_feat = bottleneck_out["final_state"]
-        else:
-            final_feat = bottleneck_out
 
-        if self.training or return_all:
-            if isinstance(bottleneck_out, dict):
-                states = bottleneck_out["states"]
-                exit_logits = bottleneck_out["exit_logits"]
-                exit_prob = bottleneck_out["exit_prob"]
-                survival = bottleneck_out["survival"]
-                halting = bottleneck_out["halting"]
+        final_feat = bottleneck_out["final_state"]
 
-                final_out = self._decode(final_feat, skip1, skip2, skip3, x_ori)
-                intermediate_preds = [self._decode(s, skip1, skip2, skip3, x_ori) for s in states]
+        # Nhánh 1: Cần trả về các tensor trung gian để feed vào hàm Loss
+        if self.training or calc_loss:
+            states = bottleneck_out["states"]
+            exit_logits = bottleneck_out["exit_logits"]
+            exit_prob = bottleneck_out["exit_prob"]
+            survival = bottleneck_out["survival"]
+            halting = bottleneck_out["halting"]
 
-                return {
-                    "final": final_out,
-                    "intermediate": intermediate_preds,
-                    "exit_logits": exit_logits,
-                    "exit_prob": exit_prob,
-                    "survival": survival,
-                    "halting": halting,
-                }
- 
-        return self._decode(final_feat, skip1, skip2, skip3, x_ori)
+            final_out = self._decode(final_feat, skip1, skip2, skip3, x_ori)
+
+            intermediate_preds = [
+                self._decode(s, skip1, skip2, skip3, x_ori)
+                for s in states
+            ]
+
+            return {
+                "final": final_out,
+                "intermediate": intermediate_preds,
+                "exit_logits": exit_logits,
+                "exit_prob": exit_prob,
+                "survival": survival,
+                "halting": halting,
+            }
+
+        # Nhánh 2: Inference bình thường
+        final_out = self._decode(final_feat, skip1, skip2, skip3, x_ori)
+
+        if return_steps:
+            return {
+                "final": final_out,
+                "exit_steps": bottleneck_out["exit_steps"],
+            }
+
+        return final_out
  
     @torch.no_grad()
     def fuse_entire_model(self):
