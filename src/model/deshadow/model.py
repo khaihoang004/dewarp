@@ -310,13 +310,15 @@ class AdaptiveLoopedBottleneck(nn.Module):
         state = x.clone() 
         survival = torch.ones(B, device=x.device, dtype=x.dtype)
         alive = torch.ones(B, device=x.device, dtype=torch.bool)
-        exit_steps = torch.ones(B, device=x.device, dtype=torch.long)
+        exit_steps = torch.zeros(B, device=x.device, dtype=torch.long)
 
         for t in range(self.max_loops):
             if not alive.any():
                 break
 
             idx = alive.nonzero(as_tuple=True)[0]
+            exit_steps[idx] += 1
+
             state_alive = state[idx]
             orig_alive = x_orig[idx]
 
@@ -332,8 +334,6 @@ class AdaptiveLoopedBottleneck(nn.Module):
 
             still_alive = (1.0 - survival[idx]) < halt_threshold
             alive[idx] = still_alive
-
-            exit_steps[idx] += still_alive.long()
 
         return {
             "final_state": state,

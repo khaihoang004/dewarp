@@ -51,7 +51,7 @@ def make_vis(inp, pred, gt):
     return vis, metrics
 
 
-# --- 1. HÀM TRAIN 1 EPOCH (SẠCH SẼ VÀ TỐI ƯU CHO LOOPVIT) ---
+# --- 1. HÀM TRAIN 1 EPOCH ---
 def train_one_epoch(
     model, loader, optimizer, scaler, criterion, device, epoch, cfg,
     aug=None, global_step=0, accumulation_steps=4, max_steps_per_epoch=500
@@ -59,6 +59,10 @@ def train_one_epoch(
     model.train()
     running_loss = 0.0
     total_steps = min(len(loader), max_steps_per_epoch)
+
+    # Thêm log_freq (bao nhiêu batch thì log lên wandb 1 lần, mặc định 50)
+    log_freq = getattr(cfg, "log_freq", 50)
+    grad_clip = getattr(cfg, "grad_clip", 1.0)
 
     pbar = tqdm(loader, total=total_steps, desc=f"Train Epoch {epoch}")
     optimizer.zero_grad(set_to_none=True)
@@ -74,7 +78,6 @@ def train_one_epoch(
             inp, gt = aug(inp, gt)
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
-
             out = model(inp, calc_loss=True)
 
             loss, loss_dict = criterion(
@@ -86,23 +89,26 @@ def train_one_epoch(
 
         loss_raw = loss.item()
         loss_scaled = loss / accumulation_steps
-
         scaler.scale(loss_scaled).backward()
 
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == total_steps:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss_raw
 
-        if batch_idx == total_steps - 1:
+        # LOG THEO TẦN SUẤT (Tránh việc đồ thị bị thiếu)
+        if (batch_idx + 1) % log_freq == 0 or (batch_idx + 1) == total_steps:
+            # Dọn dẹp key "loss/" từ criterion để wandb group đẹp hơn
+            clean_loss_dict = {f"train/{k.replace('loss/', '')}": v for k, v in loss_dict.items()}
+            
             wandb.log({
                 "train/loss": loss_raw,
                 "lr": optimizer.param_groups[0]["lr"],
-                **{f"train/{k}": v for k, v in loss_dict.items()}
+                **clean_loss_dict
             }, step=global_step)
 
         global_step += 1
@@ -111,7 +117,7 @@ def train_one_epoch(
     return running_loss / total_steps, global_step
 
 
-# --- 2. HÀM VALIDATE (KIỂM TRA DỪNG ĐỘNG - EARLY EXIT) ---
+# --- 2. HÀM VALIDATE ---
 @torch.no_grad()
 def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log_images=4):
     model.eval()
@@ -121,16 +127,17 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
     total_exit_steps = 0.0
     logged_images_count = 0
 
+    val_images_log = {} # MỚI: Gom ảnh lại log 1 lần
+
     for i, batch in enumerate(tqdm(loader, desc="Validating")):
         inp = batch["inp"].to(device)
         gt = batch["gt"].to(device)
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
-
             out = model(
                 inp,
                 halt_threshold=getattr(cfg, "halt_threshold", 0.8),
-                return_steps=True,
+                return_steps=True, # Suy luận: bật tính năng check Early Exit
             )
 
             pred = out["final"]
@@ -138,7 +145,6 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
 
         batch_size = inp.size(0)
         total_images += batch_size
-
         total_exit_steps += exit_steps.sum().item()
 
         for b in range(batch_size):
@@ -149,28 +155,29 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
 
             if log_images and logged_images_count < max_log_images:
                 vis, metrics = make_vis(inp[b:b+1], pred[b:b+1], gt[b:b+1])
-
-                wandb.log({
-                    f"val/sample_{logged_images_count}": wandb.Image(
-                        vis,
-                        caption=f"PSNR={metrics['psnr']:.2f}"
-                    )
-                }, step=global_step)
-
+                # MỚI: Chỉ lưu vào dict, không đẩy lên wandb ngay
+                val_images_log[f"val/sample_{logged_images_count}"] = wandb.Image(
+                    vis, caption=f"PSNR={metrics['psnr']:.2f}"
+                )
                 logged_images_count += 1
 
-    return {
+    # Trả về toàn bộ metrics VÀ images trong 1 Dictionary duy nhất
+    metrics_dict = {
         "val/psnr": psnr_sum / total_images,
         "val/ssim": ssim_sum / total_images,
         "val/ms_ssim": ms_ssim_sum / total_images,
         "val/rmse": rmse_sum / total_images,
         "val/avg_exit_steps": total_exit_steps / total_images,
     }
+    metrics_dict.update(val_images_log)
+    return metrics_dict
 
 
 # --- 3. MAIN TRAINING LOOP ---
 def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion, device, cfg, aug=None):
-    scaler = GradScaler(enabled=cfg.use_amp)
+    # SỬA LỖI: Thêm tham số device "cuda" cho GradScaler tương thích mọi ver PyTorch
+    scaler = GradScaler("cuda", enabled=getattr(cfg, 'use_amp', True)) 
+    
     best_psnr = 0.0
     global_step = 0
     start_epoch = 0
@@ -214,14 +221,14 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
         )
 
         val_metrics = validate(model, val_loader, device, cfg, global_step=global_step)
-        scheduler.step()
-
+        
         wandb.log({
             "epoch": epoch,
             "train/loss_epoch": train_loss,
             **val_metrics,
-            "global_step": global_step
         }, step=global_step)
+
+        scheduler.step()
 
         current_psnr = val_metrics["val/psnr"]
         avg_exit = val_metrics["val/avg_exit_steps"]
