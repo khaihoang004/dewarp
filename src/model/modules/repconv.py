@@ -298,32 +298,68 @@ class RepPointwiseBN(nn.Module):
 
 # SEPARABLE CONVOLUTION MODULES
 class RepDWSeparable3BN(nn.Module):
-    """Depthwise 3x3 -> GELU -> Pointwise 1x1"""
-    def __init__(self, in_channels, out_channels, deploy=False):
+    def __init__(self, in_channels, out_channels, expand=4, deploy=False):
         super().__init__()
-        self.dw = DWRepConv3BN(channels=in_channels, deploy=deploy)
-        self.act = nn.GELU()
-        self.pw = RepPointwiseBN(in_channels, out_channels, deploy=deploy)
+
+        self.use_skip = (in_channels == out_channels)
+        hidden = in_channels * expand
+
+        self.expand = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU()
+        )
+
+        self.dw = DWRepConv3BN(hidden, deploy=deploy)
+
+        self.project = nn.Sequential(nn.Conv2d(hidden, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels))
 
     def fuse(self, delete_branches: bool = True):
         self.dw.fuse(delete_branches)
-        self.pw.fuse(delete_branches)
 
     def forward(self, x):
-        return self.pw(self.act(self.dw(x)))
+        identity = x
 
+        x = self.expand(x)
+        x = self.dw(x)
+        x = self.project(x)
+
+        if self.use_skip:
+            x = x + identity
+
+        return x
 
 class RepDWSeparable7BN(nn.Module):
-    """Depthwise 7x7 -> ReLU -> Pointwise 1x1"""
-    def __init__(self, in_channels, out_channels, deploy=False):
+    def __init__(self, in_channels, out_channels, expand=4, deploy=False):
         super().__init__()
-        self.dw = DWRepConv7BN(channels=in_channels, deploy=deploy)
-        self.act = nn.GELU()
-        self.pw = RepPointwiseBN(in_channels, out_channels, deploy=deploy)
+
+        self.use_skip = (in_channels == out_channels)
+        hidden = in_channels * expand
+
+        self.expand = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU()
+        )
+
+        self.dw = DWRepConv7BN(hidden, deploy=deploy)
+
+        self.project = nn.Sequential(
+            nn.Conv2d(hidden, out_channels, 1, bias=False), 
+            nn.BatchNorm2d(out_channels)
+        )
 
     def fuse(self, delete_branches: bool = True):
         self.dw.fuse(delete_branches)
-        self.pw.fuse(delete_branches)
 
     def forward(self, x):
-        return self.pw(self.act(self.dw(x)))
+        identity = x
+
+        x = self.expand(x)
+        x = self.dw(x)
+        x = self.project(x)
+
+        if self.use_skip:
+            x = x + identity
+
+        return x
