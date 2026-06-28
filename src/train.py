@@ -105,13 +105,13 @@ def train_one_epoch(
             
             # --- TÍNH KỲ VỌNG SỐ VÒNG LẶP (EXPECTED STEPS) ---
             h = out["halting"] # Shape: (T, B)
-            h_mean_cpu = h_mean.detach().cpu()
             h_mean = h.mean(dim=1) # Trung bình theo batch, ra shape (T,)
+            h_mean_cpu = h_mean.detach().cpu()
 
             # --- IN RA XÁC SUẤT TẠI CÁC LOOP ---
             print(
                 f"[Step {global_step}] Halting Probs: " +
-                " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean))
+                " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean_cpu))
             )
             T_steps = h.shape[0]
             
