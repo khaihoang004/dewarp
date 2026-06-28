@@ -75,12 +75,13 @@ def train_one_epoch(
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
 
-            out = model(inp, return_all=True)
+            out = model(inp, calc_loss=True)
 
             loss, loss_dict = criterion(
                 final_pred=out["final"],
                 target=gt,
-                intermediate_preds=out.get("intermediate", None)
+                intermediate_preds=out["intermediate"],
+                halting=out["halting"],
             )
 
         loss_raw = loss.item()
@@ -126,17 +127,17 @@ def validate(model, loader, device, cfg, global_step=0, log_images=True, max_log
 
         with autocast(device_type="cuda", enabled=getattr(cfg, 'use_amp', True)):
 
-            pred = model(inp, return_all=False)   # 🔥 FIX
+            out = model(
+                inp,
+                halt_threshold=getattr(cfg, "halt_threshold", 0.8),
+                return_steps=True,
+            )
+
+            pred = out["final"]
+            exit_steps = out["exit_steps"]
 
         batch_size = inp.size(0)
         total_images += batch_size
-
-        # fallback exit step (safe version)
-        exit_steps = torch.full(
-            (batch_size,),
-            model.bottleneck.max_loops,
-            device=device
-        )
 
         total_exit_steps += exit_steps.sum().item()
 
@@ -246,7 +247,7 @@ def train_loop(model, train_loader, val_loader, optimizer, scheduler, criterion,
 
         print(f"[{epoch:3d}] Loss: {train_loss:.4f} | PSNR: {current_psnr:.3f} | Avg Exit Steps: {avg_exit:.2f}")
 
-        if (epoch + 1) >= 5 and current_psnr < 15.0:
+        if (epoch + 1) >= 5 and current_psnr < 10.0:
             print(f"Stop! At {epoch}: PSNR ({current_psnr:.3f}) < 15.0. Model is likely dying.")
             break
 
