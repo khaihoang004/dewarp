@@ -29,6 +29,7 @@ class DocDeshadowLossStage1(nn.Module):
 
     def recon_loss(self, pred, target):
         l_charb = self.charb(pred, target)
+        # SSIM càng cao càng tốt, nên loss là 1 - SSIM
         l_ssim = 1.0 - ssim(pred, target, data_range=1.0, size_average=True)
         total = l_charb + self.ssim_weight * l_ssim
         return total, l_charb, l_ssim
@@ -40,51 +41,45 @@ class DocDeshadowLossStage1(nn.Module):
         intermediate_preds=None,
         halting=None,
     ):
-        B = target.shape[0]
-
         # 1. FINAL LOSS
         final_total, final_charb, final_ssim = self.recon_loss(final_pred, target)
 
-        # 2. LOOP LOSS 
+        # 2. LOOP LOSS
         if intermediate_preds is not None and len(intermediate_preds) > 0:
             T = len(intermediate_preds)
-            rec_stack, charb_stack, ssim_stack = [], [], []
+            charb_stack, ssim_stack = [], []
 
             for p in intermediate_preds:
-                r, c, s = self.recon_loss(p, target)
-                rec_stack.append(r)
+                _, c, s = self.recon_loss(p, target)
                 charb_stack.append(c)
                 ssim_stack.append(s)
 
-            rec_stack = torch.stack(rec_stack, dim=0)     # (T,) do recon_loss đã có .mean()
-            charb_stack = torch.stack(charb_stack, dim=0)
+            charb_stack = torch.stack(charb_stack, dim=0) 
             ssim_stack = torch.stack(ssim_stack, dim=0)
+            
+            weights = torch.linspace(0.5, 1.0, steps=T, device=target.device)
+            weights = weights / weights.sum()
 
-            # Uniform weights cho Stage 1
-            h_uniform = torch.ones_like(rec_stack) / T
-
-            loop_rec = (h_uniform * rec_stack).sum(dim=0).mean()
-            loop_charb = (h_uniform * charb_stack).sum(dim=0).mean()
-            loop_ssim = (h_uniform * ssim_stack).sum(dim=0).mean()
+            loop_charb = (weights * charb_stack).sum()
+            loop_ssim = (weights * ssim_stack).sum()
+            
+            # loop_total là tổng có trọng số của các thành phần
+            loop_total = loop_charb + self.ssim_weight * loop_ssim
         else:
-            loop_rec = loop_charb = loop_ssim = torch.tensor(0.0, device=target.device)
+            loop_total = loop_charb = loop_ssim = torch.tensor(0.0, device=target.device)
 
         # 3. KL DIVERGENCE
         kl_loss = torch.tensor(0.0, device=target.device)
-
         if halting is not None:
-            # h : (T, B)
             h = halting.clamp(min=1e-8)
             T_val = h.shape[0]
             uniform = torch.full_like(h, 1.0 / T_val)
-
-            # KL(h || Uniform) = h * (log(h) - log(Uniform))
             kl_loss = (h * (h.log() - uniform.log())).sum(dim=0).mean()
 
         # 4. TOTAL LOSS
         loss = (
-            final_total
-            + self.loop_weight * loop_rec
+            final_total 
+            + self.loop_weight * loop_total 
             + self.kl_weight * kl_loss
         )
 
@@ -93,7 +88,7 @@ class DocDeshadowLossStage1(nn.Module):
             "loss/final_total": final_total.item(),
             "loss/final_charb": final_charb.item(),
             "loss/final_ssim": final_ssim.item(),
-            "loss/loop_rec": loop_rec.item(),
+            "loss/loop_total": loop_total.item(),
             "loss/loop_charb": loop_charb.item(),
             "loss/loop_ssim": loop_ssim.item(),
             "loss/kl": kl_loss.item(),
