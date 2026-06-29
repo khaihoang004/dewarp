@@ -417,7 +417,7 @@ class LoopRepDocEnhanceNet(nn.Module):
                 "final": output,
                 "intermediate": intermediate_preds,
                 "halting": b_out["halting"], 
-                "gate_logits": b_out["exit_logits"],
+                "exit_logits": b_out["exit_logits"],
                 "exit_prob": b_out["exit_prob"] 
             }
 
