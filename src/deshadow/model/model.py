@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.a_model.modules.repconv import RepConv3, RepConv7
-from src.a_model.modules.attention import DocumentAttn, RestormerAttention, MonarchAttention
+from src.deshadow.model.modules.repconv import RepConv3, RepConv7
+from src.deshadow.model.modules.attention import DocumentAttn, RestormerAttention, MonarchAttention
 
 
 class RMSNorm2d(nn.Module):
@@ -86,12 +86,10 @@ class BottleneckBlock(nn.Module):
         # Global Modeling
         # -------------------------
         self.norm1 = RMSNorm2d(dim)
-        self.attn = MonarchAttention(
-            block_size=32,
-            num_steps=5,
-            pad_type="post",
-            impl="torch"
-        )
+        
+        # Thay thế MonarchAttention bằng RestormerAttention
+        self.attn = RestormerAttention(dim=dim, num_heads=num_heads)
+        
         self.scale1 = LayerScale(dim, init_value=0.5)
 
         # -------------------------
@@ -102,25 +100,18 @@ class BottleneckBlock(nn.Module):
         self.scale2 = LayerScale(dim, init_value=0.5)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-
+        # Không cần B, C, H, W ở đây nữa vì Restormer tự xử lý shape
+        
         # ===== Global Attention =====
         x_norm = self.norm1(x)
 
-        x_flat = x_norm.flatten(2).transpose(1, 2)                     # [B, N, C]
-        x_heads = x_flat.view(B, H * W, self.num_heads, self.head_dim).transpose(1, 2)                                               # [B, heads, N, d]
-
-        attn_out = self.attn(x_heads, x_heads, x_heads)
-
-        attn_out = (
-            attn_out.transpose(1, 2)
-                    .reshape(B, H * W, C)
-                    .transpose(1, 2)
-                    .reshape(B, C, H, W)
-        )
+        # Truyền trực tiếp x_norm [B, C, H, W] vào RestormerAttention
+        # Toàn bộ phần flatten, transpose và reshape cồng kềnh đã được lược bỏ
+        attn_out = self.attn(x_norm)
 
         x = x + self.scale1(attn_out)
 
+        # ===== Channel Mixing =====
         x = x + self.scale2(self.ffn(self.norm2(x)))
 
         return x
