@@ -101,10 +101,10 @@ def train_one_epoch(
             h_mean_cpu = h_mean.detach().cpu()
 
             # --- IN RA XÁC SUẤT TẠI CÁC LOOP ---
-            # print(
-            #     f"[Step {global_step}] Halting Probs: " +
-            #     " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean_cpu))
-            # )
+            print(
+                f"[Step {global_step}] Halting Probs: " +
+                " | ".join(f"Loop {t+1}: {val:.4f}" for t, val in enumerate(h_mean_cpu))
+            )
             T_steps = h.shape[0]
             
             step_indices = torch.arange(1, T_steps + 1, device=h.device).view(T_steps, 1).float()
