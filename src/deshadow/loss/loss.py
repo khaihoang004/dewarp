@@ -41,7 +41,7 @@ class LABColorLoss(nn.Module):
         return (self.weight_l * loss_l + self.weight_a * loss_a + self.weight_b * loss_b) / 100.0
 
 
-class LoopDocEnhanceLoss(nn.Module):
+class DocDeshadowLoss(nn.Module):
     def __init__(
         self,
         ssim_weight=0.4,
