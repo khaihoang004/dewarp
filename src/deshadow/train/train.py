@@ -73,6 +73,7 @@ def train_one_epoch(
 
             loss, loss_dict = criterion(
                 final_pred=out["final"],
+                input_img=inp,
                 target=gt,
                 intermediate_preds=out["intermediate"],
                 halting=out["halting"],
