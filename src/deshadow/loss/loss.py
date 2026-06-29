@@ -69,6 +69,7 @@ class DocDeshadowLoss(nn.Module):
 
     def forward(
         self,
+        final_pred,
         input_img,
         target,
         intermediate_preds=None,
