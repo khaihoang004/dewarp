@@ -385,7 +385,7 @@ class LoopRepDocEnhanceNet(nn.Module):
         output = x_ori + residual
         return output
 
-    def forward(self, x, halt_threshold=0.80, calc_loss=False):
+    def forward(self, x, halt_threshold=0.80, calc_loss=False, return_steps=False):
         """
         Sử dụng tham số `calc_loss=True` khi Validation/Train để trả về đầy đủ dictionary.
         Mặc định trả về tensor ảnh đầu ra.
@@ -419,6 +419,12 @@ class LoopRepDocEnhanceNet(nn.Module):
                 "halting": b_out["halting"], 
                 "exit_logits": b_out["exit_logits"],
                 "exit_prob": b_out["exit_prob"] 
+            }
+        
+        if return_steps:
+            return {
+                "final": output,
+                "exit_steps": b_out["exit_steps"],
             }
 
         return output
