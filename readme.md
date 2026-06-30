@@ -48,7 +48,7 @@ Datasets supported in the notebook:
 ## Model
 
 ```python
-from src.model.deshadow.model import LoopRepDocEnhanceNet
+from src.deshadow.model.model import LoopRepDocEnhanceNet
 model = LoopRepDocEnhanceNet().to(device)
 ```
 
@@ -56,7 +56,7 @@ model = LoopRepDocEnhanceNet().to(device)
 ## Loss
 
 ```python
-from src.loss.deshadow.loss import DocDeshadowLossStage1
+from src.deshadow.loss.loss import DocDeshadowLossStage1
 
 criterion = DocDeshadowLossStage1(
     ssim_weight=cfg.loss_ssim_weight,
@@ -75,7 +75,7 @@ Loss is composed of:
 ## Training
 
 ```python
-from src.train import train_loop
+from src.deshadow.train.train import train_loop
 
 train_loop(
     model=model,
