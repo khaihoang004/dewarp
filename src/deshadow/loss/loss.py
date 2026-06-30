@@ -165,7 +165,7 @@ class DocDeshadowLoss(nn.Module):
         if intermediate_preds is not None and len(intermediate_preds) > 0:
             T = len(intermediate_preds)
             charb_stack, ssim_stack, color_stack = [], [], []
-            freq_stack = []
+            freq_stack, low_stack, high_stack = [], [], []
 
             for p in intermediate_preds:
                 recon_outs = self.recon_loss(p, input_img, target)
@@ -175,11 +175,15 @@ class DocDeshadowLoss(nn.Module):
                 ssim_stack.append(recon_outs[2])
                 color_stack.append(recon_outs[3])
                 freq_stack.append(recon_outs[4])     # l_freq ở index 4
+                low_stack.append(recon_outs[5])      # l_low ở index 5
+                high_stack.append(recon_outs[6])     # l_high ở index 6
 
             charb_stack = torch.stack(charb_stack, dim=0) 
             ssim_stack = torch.stack(ssim_stack, dim=0)
             color_stack = torch.stack(color_stack, dim=0)
             freq_stack = torch.stack(freq_stack, dim=0)
+            low_stack = torch.stack(low_stack, dim=0)
+            high_stack = torch.stack(high_stack, dim=0)
             
             # Đánh trọng số tăng dần theo thời gian/bước lặp
             weights = torch.linspace(0.5, 1.0, steps=T, device=target.device)
@@ -189,7 +193,9 @@ class DocDeshadowLoss(nn.Module):
             loop_ssim = (weights * ssim_stack).sum()
             loop_color = (weights * color_stack).sum()
             loop_freq = (weights * freq_stack).sum()
-            
+            loop_low = (weights * low_stack).sum()
+            loop_high = (weights * high_stack).sum()
+
             # Tính tổng loop_total kèm theo hệ số scale của từng loss component giống final_loss
             loop_total = (
                 loop_charb 
@@ -199,7 +205,7 @@ class DocDeshadowLoss(nn.Module):
             )
         else:
             zero_val = torch.tensor(0.0, device=target.device)
-            loop_total = loop_charb = loop_ssim = loop_color = loop_freq = zero_val
+            loop_total = loop_charb = loop_ssim = loop_color = loop_freq = loop_low = loop_high = zero_val
 
         # 3. KL DIVERGENCE (Early Exit)
         kl_loss = torch.tensor(0.0, device=target.device)
@@ -223,11 +229,15 @@ class DocDeshadowLoss(nn.Module):
             "loss/final_ssim": final_ssim.item(),
             "loss/final_color": final_color.item(),
             "loss/final_freq": final_freq.item(),
+            "loss/final_low": final_low.item(),    # Thêm log final_low
+            "loss/final_high": final_high.item(),  # Thêm log final_high
             "loss/loop_total": loop_total.item(),
             "loss/loop_charb": loop_charb.item(),
             "loss/loop_ssim": loop_ssim.item(),
             "loss/loop_color": loop_color.item(),
             "loss/loop_freq": loop_freq.item(),    # Thêm log thông số tần số trung gian
+            "loss/loop_low": loop_low.item(),      # Thêm log loop_low
+            "loss/loop_high": loop_high.item(),    # Thêm log loop_high
             "loss/kl": kl_loss.item(),
         }
 
