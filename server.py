@@ -33,16 +33,28 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using device: {DEVICE}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CKPT_PATH = os.getenv(
-    "CKPT_PATH", 
-    "src/deshadow/test/checkpoint/latest_checkpoint(0107).pth"
-)
+CKPT_PATH = None
+NGROK_AUTH_TOKEN = None
 
 try:
     from kaggle_secrets import UserSecretsClient
     user_secrets = UserSecretsClient()
-    CKPT_PATH = user_secrets.get_secret("CKPT_PATH")
-    logger.info("Đã lấy CKPT_PATH thành công từ Kaggle Secrets.")
+    
+    # CKPT_PATH
+    try:
+        CKPT_PATH = user_secrets.get_secret("CKPT_PATH")
+        logger.info("Đã lấy CKPT_PATH thành công từ Kaggle Secrets.")
+    except Exception:
+        pass
+        
+    # NGROK_AUTH_TOKEN
+    try:
+        if not NGROK_AUTH_TOKEN:
+            NGROK_AUTH_TOKEN = user_secrets.get_secret("NGROK_AUTH_TOKEN")
+            logger.info("Đã lấy NGROK_AUTH_TOKEN thành công từ Kaggle Secrets.")
+    except Exception:
+        pass
+
 except ImportError:
     pass
 except Exception as e:
@@ -52,6 +64,11 @@ if not CKPT_PATH:
     CKPT_PATH = os.getenv(
         "CKPT_PATH", 
         "src/deshadow/test/checkpoint/latest_checkpoint(0107).pth"
+    )
+
+if not NGROK_AUTH_TOKEN:
+    NGROK_AUTH_TOKEN = os.getenv(
+        "NGROK_AUTH_TOKEN"
     )
 
 logger.info(f"CKPT_PATH: {CKPT_PATH}")
@@ -210,6 +227,19 @@ def run_inference(model, x, ori_h, ori_w):
 @app.on_event("startup")
 async def startup():
     get_model()
+
+    if NGROK_AUTH_TOKEN:
+        from pyngrok import ngrok
+        try:
+            ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+            public_url = ngrok.connect(8000).public_url
+            logger.info("=====================================================")
+            logger.info(f"NGROK TUNNEL URL: {public_url}")
+            logger.info("=====================================================")
+        except Exception as e:
+            logger.error(f"Error initializing Ngrok: {e}")
+    else:
+        logger.warning("NGROK_AUTH_TOKEN not found.")
 
 @app.get("/health")
 async def health():
