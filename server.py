@@ -1,3 +1,5 @@
+import os
+import sys
 import time
 import math
 import base64
@@ -26,23 +28,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Config ────────────────────────────────────────────────────────────────
+# Config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using device: {DEVICE}")
 
-CKPT_PATH = "src/deshadow/test/checkpoint/latest_checkpoint(0107).pth"
+CKPT_PATH = os.getenv(
+    "CKPT_PATH", 
+    "src/deshadow/test/checkpoint/latest_checkpoint(0107).pth"
+)
+
 RUN_MODE = "full"
 PATCH_SIZE = 512
 OVERLAP = 256
 MAX_SIZE = 2048           # resize to avoid OOM
 
-model: LoopRepDocEnhanceNet | None = None
+model = None
 
-# ── Model loading ─────────────────────────────────────────────────────────
-def get_model() -> LoopRepDocEnhanceNet:
+# Model loading
+def get_model():
     global model
     if model is None:
         logger.info("Loading model...")
+
+        if not os.path.exists(CKPT_PATH):
+            raise FileNotFoundError(f"File weights not found: {CKPT_PATH}")
 
         m = LoopRepDocEnhanceNet().to(DEVICE)
         ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
@@ -74,7 +83,7 @@ def get_model() -> LoopRepDocEnhanceNet:
 
     return model
 
-# ── Image helpers ─────────────────────────────────────────────────────────
+# Image helpers
 def bytes_to_tensor(data: bytes):
     arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -99,7 +108,7 @@ def tensor_to_bytes(tensor: torch.Tensor, ori_h: int, ori_w: int) -> bytes:
         raise ValueError("Cannot encode output image")
     return buf.tobytes()
 
-# ── Inference helpers ─────────────────────────────────────────────────────
+# Inference helpers
 def full_image_inference(model, x, multiple=8):
     _, _, h, w = x.shape
     pad_h = (multiple - (h % multiple)) % multiple
@@ -178,7 +187,7 @@ def run_inference(model, x, ori_h, ori_w):
             y = F.interpolate(y, size=(ori_h, ori_w), mode="bilinear", align_corners=False)
     return y
 
-# ── Routes ────────────────────────────────────────────────────────────────
+# Routes
 @app.on_event("startup")
 async def startup():
     get_model()
