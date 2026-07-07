@@ -59,8 +59,6 @@ try:
             logger.info("Got NGROK_AUTH_TOKEN from Kaggle Secrets.")
     except Exception:
         pass
-    
-    MAX_SIZE = 4096
 
 except ImportError:
     pass
