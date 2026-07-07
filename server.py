@@ -36,6 +36,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CKPT_PATH = None
 NGROK_AUTH_TOKEN = None
 
+RUN_MODE = "full"
+PATCH_SIZE = 512
+OVERLAP = 256
+MAX_SIZE = 2048           # resize to avoid OOM
+
 try:
     from kaggle_secrets import UserSecretsClient
     user_secrets = UserSecretsClient()
@@ -54,6 +59,8 @@ try:
             logger.info("Got NGROK_AUTH_TOKEN from Kaggle Secrets.")
     except Exception:
         pass
+    
+    MAX_SIZE = 4096
 
 except ImportError:
     pass
@@ -72,11 +79,6 @@ if not NGROK_AUTH_TOKEN:
     )
 
 logger.info(f"CKPT_PATH: {CKPT_PATH}")
-
-RUN_MODE = "full"
-PATCH_SIZE = 512
-OVERLAP = 256
-MAX_SIZE = 2048           # resize to avoid OOM
 
 model = None
 
@@ -116,8 +118,6 @@ def get_model():
 
         model = m
         logger.info("Model ready.")
-    
-    MAX_SIZE = 4096
 
     return model
 
