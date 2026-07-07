@@ -15,16 +15,6 @@ git clean -fd
 pip install -q -r requirements.txt
 ```
 
-Main libraries used:
-
-- `torch`, `torchvision`
-- `albumentations` (image augmentation)
-- `kornia` (additional augmentation)
-- `pytorch_msssim` (SSIM loss)
-- `bitsandbytes` (8-bit AdamW optimizer)
-- `wandb` (experiment tracking)
-- `opencv-python`, `Pillow`, `matplotlib`, `tqdm`
-
 ## Data Structure
 
 Each dataset is expected to follow this directory layout:
@@ -68,7 +58,6 @@ criterion = DocDeshadowLossStage1(
 Loss is composed of:
 
 - **Charbonnier loss** — main (final) reconstruction loss.
-- **SSIM loss** — structural similarity preservation.
 - **Loop reconstruction loss** — supervises intermediate loop steps.
 - **KL loss** — regularizes the exit/step distribution (entropy/KL) across loop iterations.
 
@@ -88,3 +77,79 @@ train_loop(
     cfg=cfg,
 )
 ```
+## Running the Demo
+
+### Step 1: Prepare the Directory Structure
+Ensure your project folder contains both the model weights and your frontend files in their correct default locations:
+```text
+dewarp/
+├── main.py
+├── src/deshadow/test/checkpoint/latest_checkpoint(0107).pth  <-- Ensure weights are here
+└── static/
+    └── index.html
+```
+
+### Step 2: Install Dependencies
+```
+!pip install -q -r requirements.txt
+```
+
+### Step 3: Start the Server
+Execute the server script directly from your terminal:
+```
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+### Step 4: Access the Application
+Open your web browser and navigate to:
+`http://127.0.0.1:8000`
+
+
+
+
+
+
+
+
+
+## Running the Demo (Using Kaggle as a GPU Server)
+
+This system is designed to let you leverage the free T4 GPU on Kaggle as the AI processing server, while your Web UI runs on your local machine via an Ngrok tunnel.
+
+### Step 1: Set up Environment Variables (Kaggle Secrets)
+Before running the code, you need to configure secure environment variables on Kaggle. 
+1. Open your Kaggle Notebook.
+2. On the top menu, navigate to **Add-ons** > **Secrets**.
+3. Add the following 2 variables and **make sure to check the "Attach" box**:
+   - `NGROK_AUTH_TOKEN`: Get your free token from the [Ngrok Dashboard](https://dashboard.ngrok.com/).
+   - `CKPT_PATH`: The absolute path to your model weights on Kaggle.
+
+### Step 2: Start the Kaggle Server
+Open a new code cell on Kaggle, copy the following commands, and run them. This will automatically clone the source code, install dependencies, and start the FastAPI server alongside Ngrok:
+
+```bash
+!test -d dewarp || git clone https://github.com/khaihoang004/dewarp.git
+%cd dewarp
+!pip install -q -r requirements.txt
+!uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+When you see the line output log: NGROK TUNNEL URL: https://xxxx-xxxx.ngrok-free.app, copy that link to use in Step 3. This cell will keep running to maintain the server.
+
+### Step 3: Run the Web UI on Your Local Machine
+Once the Kaggle Server is ready and waiting for requests, switch back to your local computer:
+
+Open `client.py`
+
+Paste the Ngrok link you copied in Step 2 into the corresponding variable:
+
+```Python
+KAGGLE_NGROK_URL = "https://xxxx-xxxx.ngrok-free.app"
+```
+Open a terminal on your local machine and start the Gateway:
+
+```Bash
+python client.py
+```
+
+Open your browser and navigate to `http://127.0.0.1:8080` to experience the app powered by Kaggle's GPU.
