@@ -43,7 +43,7 @@ try:
     # CKPT_PATH
     try:
         CKPT_PATH = user_secrets.get_secret("CKPT_PATH")
-        logger.info("Đã lấy CKPT_PATH thành công từ Kaggle Secrets.")
+        logger.info("Got CKPT_PATH from Kaggle Secrets.")
     except Exception:
         pass
         
@@ -51,7 +51,7 @@ try:
     try:
         if not NGROK_AUTH_TOKEN:
             NGROK_AUTH_TOKEN = user_secrets.get_secret("NGROK_AUTH_TOKEN")
-            logger.info("Đã lấy NGROK_AUTH_TOKEN thành công từ Kaggle Secrets.")
+            logger.info("Got NGROK_AUTH_TOKEN from Kaggle Secrets.")
     except Exception:
         pass
 
