@@ -64,7 +64,7 @@ try:
     try:
         if not MAX_SIZE:
             MAX_SIZE = user_secrets.get_secret("MAX_SIZE")
-            logger.info("Got MAX_SIZE from Kaggle Secrets.")
+            logger.info(f"Got MAX_SIZE = {MAX_SIZE} from Kaggle Secrets.")
     except Exception:
         pass
 
