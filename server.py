@@ -116,6 +116,8 @@ def get_model():
 
         model = m
         logger.info("Model ready.")
+    
+    MAX_SIZE = 4096
 
     return model
 

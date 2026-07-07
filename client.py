@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-KAGGLE_NGROK_URL = "https://9d68-35-196-254-107.ngrok-free.app" 
+KAGGLE_NGROK_URL = "https://d1b6-136-107-211-108.ngrok-free.app" 
 
 
 app = FastAPI(title="Local UI Gateway")
@@ -67,8 +67,7 @@ async def proxy_deshadow(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     print("=========================================================")
-    print("🚀 BẬT SERVER GIAO DIỆN LOCAL")
-    print(f"👉 Link truy cập Web UI: http://127.0.0.1:8080")
-    print(f"👉 Đang kết nối tới GPU Kaggle tại: {KAGGLE_NGROK_URL}")
+    print(f"[INFO] Web UI: http://127.0.0.1:8080")
+    print(f"[INFO] Connecting to server at: {KAGGLE_NGROK_URL}")
     print("=========================================================")
     uvicorn.run(app, host="127.0.0.1", port=8080)
