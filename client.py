@@ -6,8 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-KAGGLE_NGROK_URL = "https://d1b6-136-107-211-108.ngrok-free.app" 
-
+KAGGLE_NGROK_URL = "https://5ecf-34-181-130-74.ngrok-free.app"
 
 app = FastAPI(title="Local UI Gateway")
 
@@ -70,4 +69,4 @@ if __name__ == "__main__":
     print(f"[INFO] Web UI: http://127.0.0.1:8080")
     print(f"[INFO] Connecting to server at: {KAGGLE_NGROK_URL}")
     print("=========================================================")
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run("client:app", host="127.0.0.1", port=8080, reload=True)

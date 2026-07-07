@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DocEnhance</title>
+<style>
+  :root {
+    --bg: #0e0f11;
+    --surface: #16181c;
+    --surface2: #1e2026;
+    --border: rgba(255,255,255,0.08);
+    --border2: rgba(255,255,255,0.14);
+    --accent: #5b9cf6;
+    --accent-dim: rgba(91,156,246,0.12);
+    --accent-hover: #78aff8;
+    --text: #e8eaf0;
+    --muted: #7a7e8a;
+    --success: #4ade80;
+    --warn: #facc15;
+    --danger: #f87171;
+    --radius: 10px;
+    --radius-lg: 16px;
+    --mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    --sans: 'DM Sans', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  a { color: var(--accent); }
+
+  /* Layout */
+  header {
+    padding: 18px 32px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    backdrop-filter: blur(8px);
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(14,15,17,0.85);
+  }
+  .logo-mark {
+    width: 32px; height: 32px;
+    background: var(--accent);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .logo-mark svg { fill: #fff; width: 18px; height: 18px; }
+  header h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+  header span { font-size: 12px; color: var(--muted); margin-left: 4px; }
+  .status-dot {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted);
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.3s;
+  }
+  .dot.ok { background: var(--success); }
+  .dot.err { background: var(--danger); }
+
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  .hero { text-align: center; margin-bottom: 40px; }
+  .hero h2 {
+    font-size: clamp(24px, 4vw, 36px);
+    font-weight: 700;
+    letter-spacing: -0.8px;
+    line-height: 1.2;
+    color: #fff;
+  }
+  .hero p { color: var(--muted); margin-top: 8px; font-size: 15px; }
+
+  /* Upload Zone */
+  .drop-zone {
+    border: 1.5px dashed var(--border2);
+    border-radius: var(--radius-lg);
+    padding: 48px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    background: var(--surface);
+    position: relative;
+  }
+  .drop-zone:hover, .drop-zone.drag { border-color: var(--accent); background: var(--accent-dim); }
+  .drop-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .drop-icon {
+    width: 48px; height: 48px;
+    border-radius: 12px;
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-bottom: 16px;
+  }
+  .drop-icon svg { stroke: var(--accent); width: 24px; height: 24px; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .drop-zone h3 { font-size: 16px; font-weight: 500; color: #fff; margin-bottom: 6px; }
+  .drop-zone p  { font-size: 13px; color: var(--muted); }
+  .tag {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 11px; font-weight: 500;
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    color: var(--muted);
+    letter-spacing: 0.4px;
+  }
+
+  /* ─── Button ─────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 22px;
+    border-radius: var(--radius);
+    border: none; cursor: pointer;
+    font-size: 14px; font-weight: 500; font-family: var(--sans);
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+  .btn-ghost {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border2);
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  .action-row {
+    display: flex; align-items: center; gap: 12px; margin-top: 20px;
+    flex-wrap: wrap;
+  }
+
+  /* ─── Preview + Result ───────────────────────── */
+  .panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-top: 32px;
+  }
+  @media (max-width: 680px) { .panels { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+  .panel-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.6px;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .panel-body {
+    min-height: 260px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px;
+    position: relative;
+  }
+  .panel-body img {
+    max-width: 100%; max-height: 480px;
+    border-radius: 8px;
+    object-fit: contain;
+    display: block;
+  }
+  .panel-empty {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 8px; color: var(--muted); font-size: 13px;
+  }
+  .panel-empty svg { stroke: var(--border2); width: 36px; height: 36px; fill: none; stroke-width: 1.5; }
+
+  /* ─── Stats bar ──────────────────────────────── */
+  .stats {
+    display: flex; flex-wrap: wrap; gap: 10px;
+    margin-top: 20px;
+  }
+  .stat-card {
+    flex: 1; min-width: 120px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .stat-label { font-size: 11px; color: var(--muted); letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 4px; }
+  .stat-value { font-size: 22px; font-weight: 600; font-family: var(--mono); color: #fff; }
+  .stat-unit  { font-size: 12px; color: var(--muted); margin-left: 3px; }
+
+  /* ─── Spinner ────────────────────────────────── */
+  .spinner {
+    display: none;
+    width: 36px; height: 36px;
+    border: 3px solid var(--border2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .processing .spinner { display: block; }
+  .processing .proc-img { display: none; }
+
+  /* ─── Progress overlay ───────────────────────── */
+  .overlay {
+    position: absolute; inset: 0;
+    background: rgba(14,15,17,0.72);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; border-radius: 0;
+    backdrop-filter: blur(3px);
+    z-index: 10;
+    display: none;
+  }
+  .overlay.show { display: flex; }
+  .overlay p { font-size: 13px; color: var(--muted); }
+
+  /* ─── Toast ──────────────────────────────────── */
+  #toast {
+    position: fixed; bottom: 28px; right: 28px;
+    padding: 12px 18px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    transform: translateY(12px); opacity: 0;
+    transition: opacity 0.25s, transform 0.25s;
+    z-index: 100; pointer-events: none;
+    max-width: 320px;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.err { border-color: var(--danger); color: var(--danger); }
+
+  /* ─── Compare slider ─────────────────────────── */
+  .compare-wrap {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+    border-radius: 8px;
+    cursor: col-resize;
+    user-select: none;
+    overflow: hidden;
+  }
+  /* base image (before) — sets the layout size */
+  .compare-wrap .img-before {
+    display: block;
+    max-width: 100%;
+    max-height: 480px;
+    pointer-events: none;
+  }
+  /* after image — same size, absolutely stacked on top, clipped via clip-path */
+  .compare-wrap .img-after {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    clip-path: inset(0 50% 0 0);
+    pointer-events: none;
+  }
+  .compare-divider {
+    position: absolute; top: 0; bottom: 0;
+    width: 2px; background: #fff;
+    left: 50%;
+    pointer-events: none;
+  }
+  .compare-handle {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    left: 50%;
+    width: 32px; height: 32px;
+    background: #fff; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: none;
+  }
+  .compare-handle svg { fill: #0e0f11; width: 14px; height: 14px; }
+
+  .compare-label {
+    position: absolute; bottom: 8px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+    padding: 3px 8px; border-radius: 6px;
+    pointer-events: none;
+  }
+  .lbl-before { left: 8px; background: rgba(0,0,0,0.6); color: #aaa; }
+  .lbl-after  { right: 8px; background: rgba(91,156,246,0.25); color: var(--accent); border: 1px solid var(--accent); }
+
+  /* ─── Section divider ────────────────────────── */
+  .section-title {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.8px; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 12px; margin-top: 32px;
+  }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<header>
+  <div class="logo-mark">
+    <svg viewBox="0 0 20 20"><path d="M10 2L3 7v6l7 5 7-5V7L10 2z"/></svg>
+  </div>
+  <h1>DocEnhance <span>v1.0</span></h1>
+  <div class="status-dot">
+    <div class="dot" id="status-dot"></div>
+    <span id="status-text">Đang kết nối…</span>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <h2>Xóa bóng trên văn bản</h2>
+  </div>
+
+  <!-- Drop Zone -->
+  <div class="drop-zone" id="dropZone">
+    <input type="file" id="fileInput" accept="image/*" />
+    <div class="drop-icon">
+      <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    </div>
+    <h3>Kéo thả hoặc nhấn để chọn ảnh</h3>
+    <p>Hỗ trợ JPG, PNG, WebP — tối đa 20 MB</p>
+    <span class="tag">JPG &nbsp;·&nbsp; PNG &nbsp;·&nbsp; WEBP</span>
+  </div>
+
+  <div class="action-row">
+    <button class="btn btn-primary" id="enhanceBtn" disabled>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      Xử lý ảnh
+    </button>
+    <button class="btn btn-ghost" id="resetBtn" style="display:none">Chọn ảnh khác</button>
+    <button class="btn btn-ghost" id="downloadBtn" style="display:none">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Tải kết quả
+    </button>
+  </div>
+
+  <!-- Preview panels -->
+  <div class="panels" id="panels" style="display:none">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Ảnh gốc</span>
+        <span id="orig-size" style="font-weight:400"></span>
+      </div>
+      <div class="panel-body">
+        <img id="origImg" src="" alt="Ảnh gốc" />
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <span>Kết quả</span>
+        <span id="result-badge"></span>
+      </div>
+      <div class="panel-body" id="resultPanel">
+        <div class="overlay" id="procOverlay">
+          <div class="spinner" style="display:block"></div>
+          <p>Đang xử lý…</p>
+        </div>
+        <div class="panel-empty" id="resultEmpty">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>
+          <p>Nhấn "Xử lý ảnh" để bắt đầu</p>
+        </div>
+        <img id="resultImg" src="" alt="Kết quả" style="display:none" />
+      </div>
+    </div>
+  </div>
+
+  <!-- Compare slider (shown after result) -->
+  <div id="compareSection" style="display:none">
+    <p class="section-title">So sánh trước / sau</p>
+    <div class="compare-wrap" id="compareWrap">
+      <img id="cmpBefore" class="img-before" src="" alt="Trước">
+      <img id="cmpAfter" class="img-after" src="" alt="Sau">
+      <div class="compare-divider" id="cmpDivider"></div>
+      <div class="compare-handle" id="cmpHandle">
+        <svg viewBox="0 0 20 20"><path d="M7 4l-4 6 4 6M13 4l4 6-4 6"/></svg>
+      </div>
+      <span class="compare-label lbl-before">TRƯỚC</span>
+      <span class="compare-label lbl-after">SAU</span>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div id="statsSection" style="display:none">
+    <p class="section-title">Thống kê suy luận</p>
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-label">Thời gian</div>
+        <div class="stat-value" id="stat-ms">—<span class="stat-unit">ms</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">FPS</div>
+        <div class="stat-value" id="stat-fps">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">VRAM</div>
+        <div class="stat-value" id="stat-vram">—<span class="stat-unit">MB</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Device</div>
+        <div class="stat-value" id="stat-device" style="font-size:16px; padding-top:4px">—</div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const API = '';   // same origin; change to http://localhost:8000 for dev
+
+const fileInput   = document.getElementById('fileInput');
+const dropZone    = document.getElementById('dropZone');
+const enhanceBtn  = document.getElementById('enhanceBtn');
+const resetBtn    = document.getElementById('resetBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const panels      = document.getElementById('panels');
+const origImg     = document.getElementById('origImg');
+const origSize    = document.getElementById('orig-size');
+const resultImg   = document.getElementById('resultImg');
+const resultEmpty = document.getElementById('resultEmpty');
+const procOverlay = document.getElementById('procOverlay');
+const compareSection = document.getElementById('compareSection');
+const statsSection   = document.getElementById('statsSection');
+const cmpBefore    = document.getElementById('cmpBefore');
+const cmpAfter     = document.getElementById('cmpAfter');
+const cmpDivider   = document.getElementById('cmpDivider');
+const cmpHandle    = document.getElementById('cmpHandle');
+const compareWrap  = document.getElementById('compareWrap');
+
+let selectedFile = null;
+let resultDataUrl = null;
+
+// ── Health check ──────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const r = await fetch(`${API}/health`);
+    const d = await r.json();
+    document.getElementById('status-dot').className = 'dot ok';
+    document.getElementById('status-text').textContent = `Online · ${d.device.toUpperCase()}`;
+  } catch {
+    document.getElementById('status-dot').className = 'dot err';
+    document.getElementById('status-text').textContent = 'Server không phản hồi';
+  }
+}
+checkHealth();
+setInterval(checkHealth, 30000);
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+function toast(msg, isErr = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = '', 3500);
+}
+
+// ── Drop zone ─────────────────────────────────────────────────────────────
+['dragover','dragenter'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); dropZone.classList.add('drag'); }));
+['dragleave','drop'].forEach(e => dropZone.addEventListener(e, () => dropZone.classList.remove('drag')));
+dropZone.addEventListener('drop', ev => {
+  ev.preventDefault();
+  const f = ev.dataTransfer.files[0];
+  if (f) setFile(f);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) setFile(fileInput.files[0]);
+});
+
+function setFile(f) {
+  if (!f.type.startsWith('image/')) { toast('Chỉ hỗ trợ file ảnh!', true); return; }
+  if (f.size > 20 * 1024 * 1024) { toast('File quá lớn (tối đa 20 MB)', true); return; }
+  selectedFile = f;
+  const url = URL.createObjectURL(f);
+  origImg.src = url;
+
+  const img = new Image();
+  img.onload = () => { origSize.textContent = `${img.naturalWidth} × ${img.naturalHeight}`; };
+  img.src = url;
+
+  panels.style.display = 'grid';
+  resultImg.style.display = 'none';
+  resultEmpty.style.display = 'flex';
+  procOverlay.classList.remove('show');
+  compareSection.style.display = 'none';
+  statsSection.style.display = 'none';
+  resultDataUrl = null;
+  enhanceBtn.disabled = false;
+  resetBtn.style.display = 'inline-flex';
+  downloadBtn.style.display = 'none';
+  document.getElementById('result-badge').textContent = '';
+}
+
+// ── Reset ─────────────────────────────────────────────────────────────────
+resetBtn.addEventListener('click', () => {
+  selectedFile = null; resultDataUrl = null;
+  origImg.src = ''; fileInput.value = '';
+  panels.style.display = 'none';
+  compareSection.style.display = 'none';
+  statsSection.style.display = 'none';
+  enhanceBtn.disabled = true;
+  resetBtn.style.display = 'none';
+  downloadBtn.style.display = 'none';
+});
+
+// ── Enhance ───────────────────────────────────────────────────────────────
+enhanceBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+
+  enhanceBtn.disabled = true;
+  procOverlay.classList.add('show');
+  resultImg.style.display = 'none';
+  resultEmpty.style.display = 'none';
+  compareSection.style.display = 'none';
+  statsSection.style.display = 'none';
+
+  const fd = new FormData();
+  fd.append('file', selectedFile);
+
+  try {
+    const res = await fetch(`${API}/deshadow`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || 'Lỗi không xác định');
+    }
+    const data = await res.json();
+
+    resultDataUrl = data.image;
+    resultImg.src = resultDataUrl;
+    resultImg.style.display = 'block';
+    procOverlay.classList.remove('show');
+
+    const badge = document.getElementById('result-badge');
+    badge.style.cssText = 'color:#4ade80;font-size:11px;font-weight:600';
+    badge.textContent = `✓ ${data.inference_ms} ms`;
+
+    // Compare
+    cmpBefore.src = origImg.src;
+    cmpAfter.src = resultDataUrl;
+    compareSection.style.display = 'block';
+
+    // Stats
+    document.getElementById('stat-ms').innerHTML = `${data.inference_ms}<span class="stat-unit">ms</span>`;
+    document.getElementById('stat-fps').textContent = data.fps;
+    document.getElementById('stat-vram').innerHTML = data.vram_mb > 0
+      ? `${data.vram_mb}<span class="stat-unit">MB</span>`
+      : `—`;
+    document.getElementById('stat-device').textContent = data.device.toUpperCase();
+    statsSection.style.display = 'block';
+
+    downloadBtn.style.display = 'inline-flex';
+    toast('Xử lý thành công!');
+  } catch (e) {
+    procOverlay.classList.remove('show');
+    resultEmpty.style.display = 'flex';
+    toast('Lỗi: ' + e.message, true);
+  } finally {
+    enhanceBtn.disabled = false;
+  }
+});
+
+// ── Download ──────────────────────────────────────────────────────────────
+downloadBtn.addEventListener('click', () => {
+  if (!resultDataUrl) return;
+  const a = document.createElement('a');
+  a.href = resultDataUrl;
+  a.download = 'deshadowed_' + (selectedFile?.name || 'result.png');
+  a.click();
+});
+
+// ── Compare slider ────────────────────────────────────────────────────────
+let dragging = false;
+
+function setSlider(x) {
+  const rect = compareWrap.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (x - rect.left) / rect.width));
+  const p = (pct * 100).toFixed(2) + '%';
+  const right = (100 - pct * 100).toFixed(2) + '%';
+  cmpAfter.style.clipPath = `inset(0 ${right} 0 0)`;
+  cmpDivider.style.left = p;
+  cmpHandle.style.left = p;
+}
+
+compareWrap.addEventListener('mousedown', e => { dragging = true; setSlider(e.clientX); });
+compareWrap.addEventListener('touchstart', e => { dragging = true; setSlider(e.touches[0].clientX); }, { passive: true });
+window.addEventListener('mousemove', e => { if (dragging) setSlider(e.clientX); });
+window.addEventListener('touchmove', e => { if (dragging) setSlider(e.touches[0].clientX); }, { passive: true });
+window.addEventListener('mouseup', () => dragging = false);
+window.addEventListener('touchend', () => dragging = false);
+</script>
+</body>
+</html>
