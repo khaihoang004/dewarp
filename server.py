@@ -32,10 +32,29 @@ app.add_middleware(
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using device: {DEVICE}")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CKPT_PATH = os.getenv(
     "CKPT_PATH", 
     "src/deshadow/test/checkpoint/latest_checkpoint(0107).pth"
 )
+
+try:
+    from kaggle_secrets import UserSecretsClient
+    user_secrets = UserSecretsClient()
+    CKPT_PATH = user_secrets.get_secret("CKPT_PATH")
+    logger.info("Đã lấy CKPT_PATH thành công từ Kaggle Secrets.")
+except ImportError:
+    pass
+except Exception as e:
+    logger.warning(f"Cannot get from Kaggle Secret: {e}")
+
+if not CKPT_PATH:
+    CKPT_PATH = os.getenv(
+        "CKPT_PATH", 
+        "src/deshadow/test/checkpoint/latest_checkpoint(0107).pth"
+    )
+
+logger.info(f"CKPT_PATH: {CKPT_PATH}")
 
 RUN_MODE = "full"
 PATCH_SIZE = 512
