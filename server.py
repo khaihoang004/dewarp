@@ -39,7 +39,7 @@ NGROK_AUTH_TOKEN = None
 RUN_MODE = "full"
 PATCH_SIZE = 512
 OVERLAP = 256
-MAX_SIZE = 2048           # resize to avoid OOM
+MAX_SIZE = None
 
 try:
     from kaggle_secrets import UserSecretsClient
@@ -59,6 +59,20 @@ try:
             logger.info("Got NGROK_AUTH_TOKEN from Kaggle Secrets.")
     except Exception:
         pass
+
+    # MAX_SIZE
+    try:
+        if not MAX_SIZE:
+            MAX_SIZE = user_secrets.get_secret("MAX_SIZE")
+            logger.info("Got MAX_SIZE from Kaggle Secrets.")
+    except Exception:
+        pass
+
+    if not MAX_SIZE:
+        MAX_SIZE = 2048
+        logger.info(f"Using default MAX_SIZE = {MAX_SIZE}")
+    else:
+        MAX_SIZE = int(MAX_SIZE)
 
 except ImportError:
     pass
@@ -202,7 +216,6 @@ def preprocess_for_inference(x, ori_h, ori_w, max_size=2048):
         new_h = max(8, (new_h // 8) * 8)
         new_w = max(8, (new_w // 8) * 8)
 
-        logger.info(f"Image too large, resizing from {ori_h}x{ori_w} to {new_h}x{new_w}")
         x = F.interpolate(x, size=(new_h, new_w), mode="bilinear", align_corners=False)
 
     return x, is_resized
