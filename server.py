@@ -245,19 +245,10 @@ async def startup():
         from pyngrok import ngrok
         try:
             ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-
-            ngrok.kill()
-
-            tunnel = ngrok.connect(
-                addr=8000,
-                proto="http",
-                domain="formlessly-electrokinetic-judith.ngrok-free.dev"
-            )
-
+            public_url = ngrok.connect(8000).public_url
             logger.info("=====================================================")
-            logger.info(f"NGROK TUNNEL URL: {tunnel.public_url}")
+            logger.info(f"NGROK TUNNEL URL: {public_url}")
             logger.info("=====================================================")
-
         except Exception as e:
             logger.error(f"Error initializing Ngrok: {e}")
     else:
