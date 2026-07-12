@@ -245,10 +245,19 @@ async def startup():
         from pyngrok import ngrok
         try:
             ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-            public_url = ngrok.connect(8000).public_url
+
+            ngrok.kill()
+
+            tunnel = ngrok.connect(
+                addr=8000,
+                proto="http",
+                domain="drippy-kitchen-simplify.ngrok-free.dev"
+            )
+
             logger.info("=====================================================")
-            logger.info(f"NGROK TUNNEL URL: {public_url}")
+            logger.info(f"NGROK TUNNEL URL: {tunnel.public_url}")
             logger.info("=====================================================")
+
         except Exception as e:
             logger.error(f"Error initializing Ngrok: {e}")
     else:
